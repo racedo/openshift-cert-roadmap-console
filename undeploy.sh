@@ -1,8 +1,8 @@
 #!/bin/bash
-# Remove the Certificate Roadmap Console from the cluster you are logged into.
+# Remove the Certificate Roadmap Console. Does not touch cert-discovery-app.
 
 set -euo pipefail
-NS=cert-discovery-app
+NS=cert-roadmap-console
 
 if ! command -v oc >/dev/null 2>&1; then
   echo "oc is required."
@@ -18,7 +18,7 @@ echo "==> Deleting namespace $NS (Deployment, Route, PVC, ConfigMap)..."
 oc delete namespace "$NS" --ignore-not-found
 
 echo "==> Deleting cluster-scoped RBAC..."
-oc delete clusterrolebinding cert-discovery-binding --ignore-not-found
-oc delete clusterrole cert-discovery-role --ignore-not-found
+oc delete clusterrolebinding cert-roadmap-console-binding --ignore-not-found
+oc delete clusterrole cert-roadmap-console-role --ignore-not-found
 
-echo "==> Removed."
+echo "==> Removed. cert-discovery-app was not changed."

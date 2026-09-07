@@ -2,34 +2,32 @@
 apiVersion: v1
 kind: Namespace
 metadata:
-  name: cert-discovery-app
+  name: cert-roadmap-console
   labels:
-    app: cert-discovery
+    app: cert-roadmap-console
 ---
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
-  name: cert-discovery-data
-  namespace: cert-discovery-app
+  name: cert-roadmap-console-data
+  namespace: cert-roadmap-console
 spec:
   accessModes:
     - ReadWriteOnce
   resources:
     requests:
-      storage: 10Gi
-  # Omit storageClassName so the cluster default StorageClass is used.
-  # Override here if your cluster has no default class.
+      storage: 1Gi
 ---
 apiVersion: v1
 kind: ServiceAccount
 metadata:
-  name: cert-discovery-sa
-  namespace: cert-discovery-app
+  name: cert-roadmap-console-sa
+  namespace: cert-roadmap-console
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
-  name: cert-discovery-role
+  name: cert-roadmap-console-role
 rules:
 - apiGroups: [""]
   resources: ["secrets", "configmaps", "namespaces"]
@@ -41,41 +39,38 @@ rules:
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
 metadata:
-  name: cert-discovery-binding
+  name: cert-roadmap-console-binding
 roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: ClusterRole
-  name: cert-discovery-role
+  name: cert-roadmap-console-role
 subjects:
 - kind: ServiceAccount
-  name: cert-discovery-sa
-  namespace: cert-discovery-app
+  name: cert-roadmap-console-sa
+  namespace: cert-roadmap-console
 ---
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: cert-discovery-app
-  namespace: cert-discovery-app
+  name: cert-roadmap-console
+  namespace: cert-roadmap-console
   labels:
-    app: cert-discovery
+    app: cert-roadmap-console
 spec:
   replicas: 1
   strategy:
     type: Recreate
   selector:
     matchLabels:
-      app: cert-discovery
+      app: cert-roadmap-console
   template:
     metadata:
       labels:
-        app: cert-discovery
+        app: cert-roadmap-console
     spec:
-      serviceAccountName: cert-discovery-sa
+      serviceAccountName: cert-roadmap-console-sa
       containers:
-      - name: cert-discovery
-        # Prefer a baked image from Container/Dockerfile when the cluster has
-        # an internal registry (oc new-build --binary --strategy=docker).
-        # Otherwise Python deps install once onto the PVC.
+      - name: cert-roadmap-console
         image: registry.redhat.io/ubi9/python-311:latest
         command: ["/bin/bash", "-c"]
         args:
@@ -101,8 +96,8 @@ spec:
           mountPath: /data
         resources:
           requests:
-            cpu: 200m
-            memory: 512Mi
+            cpu: 100m
+            memory: 256Mi
           limits:
             cpu: 1000m
             memory: 2Gi
@@ -132,10 +127,10 @@ spec:
       volumes:
       - name: app-code
         configMap:
-          name: cert-discovery-app-code
+          name: cert-roadmap-console-code
       - name: data-volume
         persistentVolumeClaim:
-          claimName: cert-discovery-data
+          claimName: cert-roadmap-console-data
       securityContext:
         runAsNonRoot: true
       restartPolicy: Always
@@ -143,13 +138,13 @@ spec:
 apiVersion: v1
 kind: Service
 metadata:
-  name: cert-discovery-service
-  namespace: cert-discovery-app
+  name: cert-roadmap-console-service
+  namespace: cert-roadmap-console
   labels:
-    app: cert-discovery
+    app: cert-roadmap-console
 spec:
   selector:
-    app: cert-discovery
+    app: cert-roadmap-console
   ports:
   - port: 80
     targetPort: 8080
@@ -160,20 +155,18 @@ spec:
 apiVersion: route.openshift.io/v1
 kind: Route
 metadata:
-  name: cert-discovery-route
-  namespace: cert-discovery-app
+  name: cert-roadmap-console-route
+  namespace: cert-roadmap-console
   labels:
-    app: cert-discovery
+    app: cert-roadmap-console
 spec:
   to:
     kind: Service
-    name: cert-discovery-service
+    name: cert-roadmap-console-service
     weight: 100
   port:
     targetPort: http
   tls:
     termination: edge
-    # Allow HTTP and HTTPS. Redirect would force HTTPS and break browsers that
-    # do not trust the lab ingress CA.
     insecureEdgeTerminationPolicy: Allow
   wildcardPolicy: None

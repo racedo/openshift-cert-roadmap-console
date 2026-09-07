@@ -7,7 +7,7 @@ It answers two questions on a live cluster:
 1. **Why is this on the roadmap?** Each [HPSTRAT-99](https://issues.redhat.com/browse/HPSTRAT-99) Feature (10-year signers, validity caps, RSA 4096, external CA, rotation visibility) is grouped with the certificates on *this* API that still show the gap.
 2. **How does that look to users today?** The same page is the inventory: what OpenShift rotates, what it will not, lifetime, issuer, and owning component.
 
-It is not a generic cluster certificate scanner, and it is not the [missing-owners](https://github.com/racedo/openshift-missing-owners) collector check. Deploy it on a cluster, open the UI, and walk engineering through **HPSTRAT-99** and **What to fix**.
+It is not the original [openshift-certificate-analyzer](https://github.com/racedo/openshift-certificate-analyzer) inventory app, and it is not the [missing-owners](https://github.com/racedo/openshift-missing-owners) collector check. Deploy it to its own namespace; it does not replace `cert-discovery-app`.
 
 ## Deploy on OpenShift
 
@@ -29,7 +29,7 @@ oc login --server=<api-url> --token=<token>   # or: export KUBECONFIG=/path/to/k
 The script prints a URL when the pod is ready. Open it in a browser.
 
 ```text
-http://cert-discovery-route-cert-discovery-app.apps.<cluster>/
+http://cert-roadmap-console-route-cert-roadmap-console.apps.<cluster>/
 ```
 
 Use **http://** if HTTPS fails certificate verification against the cluster’s default router cert.
@@ -42,23 +42,21 @@ Refresh after you edit `Container/app.py`:
 ./deploy.sh
 ```
 
-Remove it:
+Remove it (`cert-discovery-app` is left in place):
 
 ```bash
 ./undeploy.sh
 ```
 
-OpenShift object names stay `cert-discovery-app` / `cert-discovery-route` so an existing lab Route keeps working.
-
 ### What gets created
 
 | Resource | Name |
 | --- | --- |
-| Namespace | `cert-discovery-app` |
-| Deployment | `cert-discovery-app` |
-| ConfigMap (live Python) | `cert-discovery-app-code` |
-| ClusterRole / Binding | `cert-discovery-role` / `cert-discovery-binding` |
-| Route | `cert-discovery-route` |
+| Namespace | `cert-roadmap-console` |
+| Deployment | `cert-roadmap-console` |
+| ConfigMap (live Python) | `cert-roadmap-console-code` |
+| ClusterRole / Binding | `cert-roadmap-console-role` / `cert-roadmap-console-binding` |
+| Route | `cert-roadmap-console-route` |
 
 There is **no image build**. `./deploy.sh` loads `Container/app.py` into a ConfigMap and runs it on UBI Python 3.11.
 
@@ -91,7 +89,7 @@ Platform TLS collector rules: [OpenShift TLS registry](https://github.com/opensh
 | `ImagePullBackOff` | The node must pull `registry.redhat.io/ubi9/python-311:latest` (cluster pull secret) |
 | Pod stuck, PVC already exists | Harmless if you see `spec is immutable`; `./deploy.sh` continues |
 | Browser TLS error on the Route | Use the `http://` URL the script prints |
-| First rollout timeout | Watch `oc logs -n cert-discovery-app deploy/cert-discovery-app` — pip may still be installing |
+| First rollout timeout | Watch `oc logs -n cert-roadmap-console deploy/cert-roadmap-console` — pip may still be installing |
 
 ## License
 
