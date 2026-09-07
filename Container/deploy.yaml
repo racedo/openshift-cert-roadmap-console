@@ -1,0 +1,179 @@
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: cert-discovery-app
+  labels:
+    app: cert-discovery
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: cert-discovery-data
+  namespace: cert-discovery-app
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 10Gi
+  # Omit storageClassName so the cluster default StorageClass is used.
+  # Override here if your cluster has no default class.
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: cert-discovery-sa
+  namespace: cert-discovery-app
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: cert-discovery-role
+rules:
+- apiGroups: [""]
+  resources: ["secrets", "configmaps", "namespaces"]
+  verbs: ["get", "list"]
+- apiGroups: ["config.openshift.io"]
+  resources: ["infrastructures"]
+  verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: cert-discovery-binding
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: cert-discovery-role
+subjects:
+- kind: ServiceAccount
+  name: cert-discovery-sa
+  namespace: cert-discovery-app
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cert-discovery-app
+  namespace: cert-discovery-app
+  labels:
+    app: cert-discovery
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: cert-discovery
+  template:
+    metadata:
+      labels:
+        app: cert-discovery
+    spec:
+      serviceAccountName: cert-discovery-sa
+      containers:
+      - name: cert-discovery
+        # Prefer a baked image from Container/Dockerfile when the cluster has
+        # an internal registry (oc new-build --binary --strategy=docker).
+        # Otherwise Python deps install once onto the PVC.
+        image: registry.redhat.io/ubi9/python-311:latest
+        command: ["/bin/bash", "-c"]
+        args:
+        - |
+          set -e
+          if python3 -c "import flask, kubernetes, cryptography" >/dev/null 2>&1; then
+            exec python3 /app/app.py
+          fi
+          VENV=/data/venv
+          if [ ! -x "$VENV/bin/python" ] || ! "$VENV/bin/python" -c "import flask, kubernetes, cryptography" >/dev/null 2>&1; then
+            python3 -m venv "$VENV"
+            "$VENV/bin/pip" install --no-cache-dir -r /app/requirements.txt
+          fi
+          exec "$VENV/bin/python" /app/app.py
+        workingDir: /app
+        ports:
+        - containerPort: 8080
+          name: http
+        volumeMounts:
+        - name: app-code
+          mountPath: /app
+        - name: data-volume
+          mountPath: /data
+        resources:
+          requests:
+            cpu: 200m
+            memory: 512Mi
+          limits:
+            cpu: 1000m
+            memory: 2Gi
+        livenessProbe:
+          httpGet:
+            path: /healthz
+            port: 8080
+          initialDelaySeconds: 90
+          periodSeconds: 30
+          timeoutSeconds: 3
+        readinessProbe:
+          httpGet:
+            path: /healthz
+            port: 8080
+          initialDelaySeconds: 10
+          periodSeconds: 10
+          timeoutSeconds: 3
+          failureThreshold: 18
+        securityContext:
+          allowPrivilegeEscalation: false
+          runAsNonRoot: true
+          capabilities:
+            drop:
+            - ALL
+          seccompProfile:
+            type: RuntimeDefault
+      volumes:
+      - name: app-code
+        configMap:
+          name: cert-discovery-app-code
+      - name: data-volume
+        persistentVolumeClaim:
+          claimName: cert-discovery-data
+      securityContext:
+        runAsNonRoot: true
+      restartPolicy: Always
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: cert-discovery-service
+  namespace: cert-discovery-app
+  labels:
+    app: cert-discovery
+spec:
+  selector:
+    app: cert-discovery
+  ports:
+  - port: 80
+    targetPort: 8080
+    protocol: TCP
+    name: http
+  type: ClusterIP
+---
+apiVersion: route.openshift.io/v1
+kind: Route
+metadata:
+  name: cert-discovery-route
+  namespace: cert-discovery-app
+  labels:
+    app: cert-discovery
+spec:
+  to:
+    kind: Service
+    name: cert-discovery-service
+    weight: 100
+  port:
+    targetPort: http
+  tls:
+    termination: edge
+    # Allow HTTP and HTTPS. Redirect would force HTTPS and break browsers that
+    # do not trust the lab ingress CA.
+    insecureEdgeTerminationPolicy: Allow
+  wildcardPolicy: None
