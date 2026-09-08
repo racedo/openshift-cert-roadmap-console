@@ -352,6 +352,22 @@ INSTALLER_NO_ROTATE = frozenset({
     'admin-kubeconfig-signer',
     'kubelet-bootstrap-kubeconfig-signer',
 })
+INSTALLER_KEYLESS_CA_CN = frozenset({
+    'admin-kubeconfig-signer',
+    'kubelet-bootstrap-kubeconfig-signer',
+})
+INSTALLER_KEYLESS_NOTES = {
+    'revocable-bootstrap': (
+        'Installer leftover client CA; no private key. Deleting this ConfigMap '
+        'revokes installer master-bootstrap client certs. New workers already use '
+        'the node-bootstrapper token. Do not delete while control-plane nodes still '
+        'use the original cert-based /etc/kubernetes/kubeconfig.'
+    ),
+    'keep-recovery': (
+        'Installer leftover client CA; no private key. Keep this: it authenticates '
+        'the original admin kubeconfig. Removing it invalidates that kubeconfig.'
+    ),
+}
 # OpenShift 10y = 10 * 365 * 24h (not calendar years). Days remaining is not lifetime.
 TEN_YEAR_DAYS = 3650
 # Floor so 3649d leap/day rounding still counts. Rotating signers that reuse
@@ -954,6 +970,8 @@ def classify_no_auto_rotate(name, cert_role, validity_days, injected_ca_copy,
     clusters. Serving leaves that embed a 10y signer in tls.crt still rotate.
     CA bundles and other keyless copies that merely *contain* a 10-year CA
     are not will-not-rotate work items (the signer secret with the key is).
+    Exception: a dedicated leftover installer CA (single PEM, no private key)
+    never rotates because the key was deleted with the bootstrap machine.
     """
     if name in CNO_OPERATOR_PKI_SIGNERS:
         return False, ''
@@ -970,6 +988,13 @@ def classify_no_auto_rotate(name, cert_role, validity_days, injected_ca_copy,
         return True, 'ocpstrat-1826'
     if name in INSTALLER_NO_ROTATE:
         return True, 'installer-10y'
+    cn = subject_cn((primary or {}).get('subject'))
+    if (
+        not has_private_key
+        and len(certs) == 1
+        and cn in INSTALLER_KEYLESS_CA_CN
+    ):
+        return True, 'installer-10y-keyless'
     if cert_role == 'ca-bundle' or not has_private_key:
         return False, ''
     if cert_role == 'leaf':
@@ -985,6 +1010,7 @@ def classify_no_auto_rotate(name, cert_role, validity_days, injected_ca_copy,
 NO_ROTATE_LABELS = {
     'ocpstrat-1826': 'OCPSTRAT-1826 foreverPeriod',
     'installer-10y': 'Installer 10-year signer',
+    'installer-10y-keyless': 'Installer leftover CA (no key)',
     'hypershift-10y': 'HyperShift 10-year CA',
 }
 
@@ -993,6 +1019,14 @@ def no_rotate_label_for(reason):
     if not reason:
         return ''
     return NO_ROTATE_LABELS.get(reason) or 'Will not auto-rotate'
+
+
+def installer_keyless_lifecycle(name, cn):
+    if name == 'kubelet-bootstrap-kubeconfig' or cn == 'kubelet-bootstrap-kubeconfig-signer':
+        return 'revocable-bootstrap'
+    if name == 'admin-kubeconfig-client-ca' or cn == 'admin-kubeconfig-signer':
+        return 'keep-recovery'
+    return ''
 
 
 def management_display(managed_status, will_not_rotate, no_rotate_reason, injected_ca_copy,
@@ -1007,6 +1041,8 @@ def management_display(managed_status, will_not_rotate, no_rotate_reason, inject
             return 'Will not auto-rotate (OCPSTRAT-1826)', 'critical'
         if no_rotate_reason == 'installer-10y':
             return 'Will not auto-rotate (installer 10y)', 'critical'
+        if no_rotate_reason == 'installer-10y-keyless':
+            return 'Will not auto-rotate (installer leftover, no key)', 'critical'
         if no_rotate_reason == 'hypershift-10y':
             return 'Will not auto-rotate (10-year CA)', 'critical'
         return 'Will not auto-rotate', 'critical'
@@ -1259,6 +1295,10 @@ def process_resource_obj(resource_type, obj, cert_data, has_private_key, cert_fi
             name, cert_role, validity_days, injected_ca_copy, resource_type,
             has_private_key=has_private_key, pem_certs=pem_certs
         )
+        installer_lifecycle = (
+            installer_keyless_lifecycle(name, subject_cn(parsed.get('subject')))
+            if no_rotate_reason == 'installer-10y-keyless' else ''
+        )
         managed_status, managed_details = determine_managed_status(
             resource_type, name, namespace, cert_data, issuer, validity_days,
             annotations, labels, will_not_rotate
@@ -1349,6 +1389,8 @@ def process_resource_obj(resource_type, obj, cert_data, has_private_key, cert_fi
             'will_not_auto_rotate': will_not_rotate,
             'no_rotate_reason': no_rotate_reason,
             'no_rotate_label': no_rotate_label_for(no_rotate_reason) if will_not_rotate else '',
+            'installer_ca_lifecycle': installer_lifecycle,
+            'installer_ca_note': INSTALLER_KEYLESS_NOTES.get(installer_lifecycle, ''),
             'is_forever_period_signer': name in FOREVER_PERIOD_SIGNERS,
             'is_ocpstrat_1826': name in OCPSTRAT_1826_NO_ROTATE,
             'injected_ca_copy': injected_ca_copy,
@@ -1644,6 +1686,7 @@ JIRA_BROWSE = 'https://issues.redhat.com/browse/'
 WORK_TICKETS = {
     'ocpstrat-1826': ('OCPSTRAT-1826', JIRA_BROWSE + 'OCPSTRAT-1826'),
     'installer-10y': ('OCPSTRAT-1826', JIRA_BROWSE + 'OCPSTRAT-1826'),
+    'installer-10y-keyless': ('OCPSTRAT-1826', JIRA_BROWSE + 'OCPSTRAT-1826'),
     'hypershift-10y': ('OCPSTRAT-1826', JIRA_BROWSE + 'OCPSTRAT-1826'),
     'rsa-ca-below-4096': ('OCPSTRAT-2271', JIRA_BROWSE + 'OCPSTRAT-2271'),
     'past-rotate-at': ('OCPSTRAT-1990', JIRA_BROWSE + 'OCPSTRAT-1990'),
@@ -1658,6 +1701,7 @@ WORK_ACTIONS = {
     'missing-owner-known': 'Grandfathered OpenShift TLS-registry violation (remove-only). Still needs an owner; do not add more of these.',
     'ocpstrat-1826': 'kube-apiserver foreverPeriod artifact. No supported auto or manual rotation yet (OCPSTRAT-1826).',
     'installer-10y': 'Installer created-once 10-year signer. Same rotation gap as OCPSTRAT-1826.',
+    'installer-10y-keyless': 'Installer leftover CA: public cert only; the private key was deleted with the bootstrap machine. This object will never be regenerated. kubelet-bootstrap-kubeconfig can be deleted to revoke installer master-bootstrap client certs after control-plane kubeconfigs no longer use them. admin-kubeconfig-client-ca must be kept for the original admin kubeconfig.',
     'hypershift-10y': 'HyperShift created-once 10-year CA (private key is on this API). Same rotation gap as OCPSTRAT-1826.',
     'rsa-ca-below-4096': 'Self-signed RSA signer below 4096 bits. OCPSTRAT-2271 (TP) / OCPSTRAT-3050 (GA) require 4096 for RSA root CAs; re-issue this signer key.',
     'user-managed': 'OpenShift will not rotate this because an administrator supplied it. Rotate it before expiry, or move it onto Service-CA / an operator. This is not OCPSTRAT-1826 (those are platform 10-year signers).',
@@ -1731,6 +1775,12 @@ def _work_item(cert, category, why, status=''):
     ticket_key = why if why in WORK_TICKETS else category
     ticket, ticket_url = WORK_TICKETS.get(ticket_key, ('', ''))
     action_key = why if why in WORK_ACTIONS else category
+    lifecycle = cert.get('installer_ca_lifecycle') or ''
+    action = WORK_ACTIONS.get(action_key, '')
+    if lifecycle == 'keep-recovery':
+        action = INSTALLER_KEYLESS_NOTES.get(lifecycle, action)
+    elif lifecycle == 'revocable-bootstrap':
+        action = INSTALLER_KEYLESS_NOTES.get(lifecycle, action)
     return {
         'category': category,
         'category_label': WORK_CATEGORY_LABELS.get(category, category),
@@ -1738,7 +1788,7 @@ def _work_item(cert, category, why, status=''):
         'why': why,
         'ticket': ticket,
         'ticket_url': ticket_url,
-        'action': WORK_ACTIONS.get(action_key, ''),
+        'action': action,
         'owning_component': (cert.get('owning_component') or '').strip(),
         'needs_owning_component': cert.get('tls_registry_status') in ('uncovered', 'registered'),
         'owner_not_required_reason': cert.get('owner_not_required_reason') or '',
@@ -1758,6 +1808,8 @@ def _work_item(cert, category, why, status=''):
         'rotate_at': cert.get('rotate_at') or '',
         'rotate_at_source': cert.get('rotate_at_source') or '',
         'days_until_rotate': cert.get('days_until_rotate'),
+        'installer_ca_lifecycle': lifecycle,
+        'installer_ca_note': cert.get('installer_ca_note') or '',
     }
 
 
@@ -2050,6 +2102,8 @@ def compact_cert(cert):
         'private_key': bool(cert.get('has_private_key')),
         'has_private_key': bool(cert.get('has_private_key')),
         'missing_owner': cert.get('tls_registry_status') == 'uncovered',
+        'installer_ca_lifecycle': cert.get('installer_ca_lifecycle') or '',
+        'installer_ca_note': cert.get('installer_ca_note') or '',
     }
 
 @app.route('/')
@@ -2818,6 +2872,11 @@ HTML_TEMPLATE = '''
                                 {% if item.copy_count and item.copy_count > 1 %}
                                 <div class="muted">{{ item.copy_count }} copies of this certificate</div>
                                 {% endif %}
+                                {% if item.installer_ca_lifecycle == 'keep-recovery' %}
+                                <div class="muted">Keep: original admin kubeconfig CA</div>
+                                {% elif item.installer_ca_lifecycle == 'revocable-bootstrap' %}
+                                <div class="muted">Revocable leftover master-bootstrap CA</div>
+                                {% endif %}
                             </td>
                             {% if group.ticket == 'OCPSTRAT-2029' %}
                             <td class="owner-cell">{% if item.issuer %}<code>{{ item.issuer }}</code>{% else %}—{% endif %}</td>
@@ -3165,6 +3224,11 @@ HTML_TEMPLATE = '''
                     {% if cert.will_not_auto_rotate %}
                     <div><span class="pill status-critical">will not auto-rotate</span></div>
                     {% endif %}
+                    {% if cert.installer_ca_lifecycle == 'keep-recovery' %}
+                    <div class="muted">Keep: original admin kubeconfig CA</div>
+                    {% elif cert.installer_ca_lifecycle == 'revocable-bootstrap' %}
+                    <div class="muted">Revocable leftover master-bootstrap CA</div>
+                    {% endif %}
                 </td>
                 <td>{{ cert.namespace }}</td>
                 <td class="owner-cell">
@@ -3192,11 +3256,14 @@ HTML_TEMPLATE = '''
                 </td>
                 <td class="why-cell">
                     {% if cert.no_rotate_label %}{{ cert.no_rotate_label }}{% endif %}
+                    {% if cert.installer_ca_note %}
+                    <div class="muted">{{ cert.installer_ca_note }}</div>
+                    {% endif %}
                     {% if cert.registry_why_lines %}
                         {% for line in cert.registry_why_lines %}
-                        <div{% if cert.no_rotate_label or not loop.first %} class="muted"{% endif %}>{{ line }}</div>
+                        <div{% if cert.no_rotate_label or cert.installer_ca_note or not loop.first %} class="muted"{% endif %}>{{ line }}</div>
                         {% endfor %}
-                    {% elif not cert.no_rotate_label %}
+                    {% elif not cert.no_rotate_label and not cert.installer_ca_note %}
                     —
                     {% endif %}
                 </td>
