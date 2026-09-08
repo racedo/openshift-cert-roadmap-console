@@ -2790,7 +2790,7 @@ HTML_TEMPLATE = '''
                         <tr>
                             <td class="row-num">{{ loop.index }}</td>
                             <td>
-                                {% if item.status == 'new' %}
+                                {% if item.category == 'will-not-rotate' or item.status == 'new' %}
                                 <span class="pill status-critical">{{ item.category_label }}</span>
                                 {% elif item.status == 'grandfathered' %}
                                 <span class="pill status-warning">{{ item.category_label }} (known)</span>
