@@ -877,6 +877,29 @@ def determine_tls_registry_status(namespace, owning_component, injected_ca_copy,
     return 'uncovered'
 
 
+def collector_owner_skip_reason(resource_type, obj, namespace, name):
+    """Why owning-component is not required, or '' if the collector requires it."""
+    ns = namespace or ''
+    if name in INJECTED_CA_BUNDLE_NAMES:
+        return (
+            f'Injected CA replica ({name}); collector skips kube-root-ca.crt / service-ca copies'
+        )
+    if not is_tls_registry_namespace(ns):
+        return (
+            f'{ns} is not an OpenShift platform namespace '
+            f'(openshift-*, kubernetes-*, kube-system, …)'
+        )
+    if is_revisioned_tls_object(obj):
+        return 'Skipped: owner reference is revision-status-*'
+    if is_monitoring_hashed_tls_object(obj):
+        return 'Skipped: label monitoring.openshift.io/hash'
+    if origin_registry_kind(resource_type, obj):
+        return ''
+    if resource_type == 'secret':
+        return 'Not InspectSecret: no tls.crt or kubeconfig client cert'
+    return 'Not InspectConfigMap: no CA-bundle key or kubeconfig CA'
+
+
 def missing_owner_why_lines(namespace, resource_type, origin_kind, data_fields, known):
     """Why the OpenShift TLS collector puts this object in Missing owners (four checks)."""
     ns = namespace or ''
@@ -1336,6 +1359,11 @@ def process_resource_obj(resource_type, obj, cert_data, has_private_key, cert_fi
             'issuer_origin': issuer_origin,
             'tls_registry_status': tls_registry_status,
             'missing_owner': tls_registry_status == 'uncovered',
+            'needs_owning_component': tls_registry_status in ('uncovered', 'registered'),
+            'owner_not_required_reason': (
+                '' if tls_registry_status in ('uncovered', 'registered') else
+                collector_owner_skip_reason(resource_type, obj, namespace, name)
+            ),
             'origin_kind': origin_kind,
             'known_origin_violation': known_origin_violation,
             'registry_why_lines': (
@@ -1567,42 +1595,6 @@ def origin_ownership_inventory(certificates):
     return expected, extras
 
 
-def tls_registry_report(certificates):
-    """Live ownership.md analogue: TLS artifacts grouped by owning Jira component.
-
-    In-cluster only. Payload e2e also merges on-disk node files as Other locations.
-    """
-    artifacts = [c for c in (certificates or []) if c and c.get('origin_kind')]
-    by_owner = {}
-    for c in artifacts:
-        owner = c.get('owning_component') or ''
-        if not owner:
-            continue
-        rec = by_owner.setdefault(owner, {'certificates': [], 'ca_bundles': []})
-        row = compact_cert(c)
-        if c.get('origin_kind') == 'certificate':
-            rec['certificates'].append(row)
-        else:
-            rec['ca_bundles'].append(row)
-    groups = []
-    for owner in sorted(by_owner.keys()):
-        rec = by_owner[owner]
-        rec['certificates'].sort(key=lambda r: ((r.get('namespace') or ''), (r.get('name') or '')))
-        rec['ca_bundles'].sort(key=lambda r: ((r.get('namespace') or ''), (r.get('name') or '')))
-        groups.append({
-            'owner': owner,
-            'count': len(rec['certificates']) + len(rec['ca_bundles']),
-            'certificates': rec['certificates'],
-            'ca_bundles': rec['ca_bundles'],
-        })
-    return {
-        'artifact_count': len(artifacts),
-        'owner_count': len(groups),
-        'missing_count': sum(1 for c in artifacts if not c.get('owning_component')),
-        'by_owner': groups,
-    }
-
-
 def unique_non_rotating_cas(certificates):
     """One row per 10-year non-rotating CA fingerprint, including injected copies."""
     by_fp = {}
@@ -1748,6 +1740,8 @@ def _work_item(cert, category, why, status=''):
         'ticket_url': ticket_url,
         'action': WORK_ACTIONS.get(action_key, ''),
         'owning_component': (cert.get('owning_component') or '').strip(),
+        'needs_owning_component': cert.get('tls_registry_status') in ('uncovered', 'registered'),
+        'owner_not_required_reason': cert.get('owner_not_required_reason') or '',
         'owner_group': _owner_group(cert),
         'namespace': cert.get('namespace') or '',
         'name': cert.get('name') or '',
@@ -2040,6 +2034,8 @@ def compact_cert(cert):
         'rotate_at_source': cert.get('rotate_at_source'),
         'issuer_origin': cert.get('issuer_origin'),
         'tls_registry_status': cert.get('tls_registry_status'),
+        'needs_owning_component': cert.get('tls_registry_status') in ('uncovered', 'registered'),
+        'owner_not_required_reason': cert.get('owner_not_required_reason') or '',
         'origin_kind': cert.get('origin_kind'),
         'known_origin_violation': cert.get('known_origin_violation'),
         'registry_why_lines': cert.get('registry_why_lines') or [],
@@ -2083,7 +2079,6 @@ def index():
         origin_expected, origin_new = origin_ownership_inventory(certificates)
         uncovered_certificates = [c for c in uncovered if c.get('origin_kind') == 'certificate']
         uncovered_ca_bundles = [c for c in uncovered if c.get('origin_kind') == 'ca-bundle']
-        tls_registry = tls_registry_report(certificates)
         unique_cas = unique_non_rotating_cas(certificates)
         workboard = workboard_report(certificates)
         summary['unique_10y_cas'] = len(unique_cas)
@@ -2102,7 +2097,6 @@ def index():
             origin_new=origin_new,
             uncovered_certificates=uncovered_certificates,
             uncovered_ca_bundles=uncovered_ca_bundles,
-            tls_registry=tls_registry,
             unique_cas=unique_cas,
             workboard=workboard,
             hosted_guest=hosted_guest,
@@ -2207,22 +2201,6 @@ def api_uncovered():
         })
     except Exception as e:
         logger.error(f"Error in uncovered endpoint: {e}", exc_info=True)
-        return jsonify({'error': str(e)}), 500
-
-@app.route('/api/tls-registry')
-def api_tls_registry():
-    """Live OpenShift TLS registry: in-cluster artifacts grouped by owning component."""
-    try:
-        certificates, cluster_name, last_update = cert_cache.get_data()
-        report = tls_registry_report(certificates)
-        expected, extras = origin_ownership_inventory(certificates)
-        report['cluster_name'] = cluster_name
-        report['last_update'] = last_update.isoformat() if last_update else None
-        report['origin_known_violations'] = expected
-        report['new_missing_owners'] = [compact_cert(c) for c in extras]
-        return jsonify(report)
-    except Exception as e:
-        logger.error(f"Error in tls-registry endpoint: {e}", exc_info=True)
         return jsonify({'error': str(e)}), 500
 
 @app.route('/api/history')
@@ -2591,7 +2569,6 @@ HTML_TEMPLATE = '''
             &nbsp;|&nbsp; <a href="/api/workboard">Workboard JSON</a>
             &nbsp;|&nbsp; <a href="/api/certificates">Full JSON</a>
             &nbsp;|&nbsp; <a href="/api/uncovered">Missing-owner API</a>
-            &nbsp;|&nbsp; <a href="/api/tls-registry">TLS registry API</a>
         </div>
         <details class="glossary">
             <summary>Glossary — TLS registry, signer, CA, PEM, leaf, rotation, foreverPeriod, owning component</summary>
@@ -2609,8 +2586,8 @@ HTML_TEMPLATE = '''
                         The human report is
                         <a href="https://github.com/openshift/origin/blob/main/tls/README.md" target="_blank" rel="noopener noreferrer">tls/README.md</a>
                         / <a href="https://github.com/openshift/origin/blob/main/tls/ownership/ownership.md" target="_blank" rel="noopener noreferrer">ownership.md</a>
-                        (grouped by owning Jira component). This app builds that report from <em>this</em> cluster.
-                        Payload e2e also scrapes cert files on nodes; this console does not.
+                        (grouped by owning Jira component). The missing-owners app on this cluster
+                        groups live artifacts the same way. Payload e2e also scrapes cert files on nodes; this console does not.
                         <span class="use">Used for: knowing every platform TLS artifact, who owns it, and blocking new artifacts that lack <code>openshift.io/owning-component</code>.</span></dd>
                     <dt>TLS artifact</dt>
                     <dd>OpenShift’s name for a certificate key pair <em>or</em> a CA bundle in the TLS registry — a secret or configmap the collector accepted, not every PEM in the cluster.
@@ -2760,7 +2737,8 @@ HTML_TEMPLATE = '''
             Rows under a Feature are examples on this API of why that work matters — for example, certificates already past rotate-at.
             <a href="https://issues.redhat.com/browse/OCPSTRAT-2029" target="_blank" rel="noopener noreferrer">OCPSTRAT-2029</a>
             is missing product capability (customer intermediate CA), not a PEM list.
-            Owning component is <code>openshift.io/owning-component</code> (empty → unassigned).
+            Owning component is <code>openshift.io/owning-component</code>
+            (required on collector-accepted platform TLS artifacts; otherwise labeled not required).
             CA-bundle copies of the same 10-year CA are not listed.
             JSON: <a href="/api/workboard">/api/workboard</a>.</p>
         {% if workboard and workboard.by_ticket %}
@@ -2823,7 +2801,17 @@ HTML_TEMPLATE = '''
                                 {% endif %}
                             </td>
                             {% if group.ticket != 'OCPSTRAT-2271' %}
-                            <td class="owner-cell">{% if item.owning_component %}{{ item.owning_component }}{% else %}unassigned{% endif %}</td>
+                            <td class="owner-cell">
+                                {% if item.owning_component %}
+                                {{ item.owning_component }}
+                                {% elif item.needs_owning_component %}
+                                <span class="pill status-critical">no owner</span>
+                                <div class="muted">Does not comply: collector requires openshift.io/owning-component</div>
+                                {% else %}
+                                <span class="pill status-user">not required</span>
+                                <div class="muted">{{ item.owner_not_required_reason }}</div>
+                                {% endif %}
+                            </td>
                             {% endif %}
                             <td>{{ item.namespace }}</td>
                             <td><code>{{ item.name }}</code>
@@ -3108,86 +3096,28 @@ HTML_TEMPLATE = '''
                         {% if not row.found %}
                         <span class="pill status-user" title="This ownership.md name is not present in this cluster’s API (common on hosted guests).">not on this API</span>
                         {% elif row.still_missing %}
-                        <span class="pill status-warning" title="Present and still missing openshift.io/owning-component. Grandfathered: OpenShift CI allows these five; do not add more.">present, no owner</span>
+                        <span class="pill status-critical" title="Present and still missing openshift.io/owning-component. Grandfathered: OpenShift CI allows these five; do not add more.">present, no owner</span>
                         {% else %}
                         <span class="pill status-good" title="Present and now has an owning-component (no longer a missing-owner gap).">present, has owner</span>
                         {% endif %}
                     </td>
-                    <td class="owner-cell">{{ row.owning_component or '—' }}</td>
+                    <td class="owner-cell">
+                        {% if row.owning_component %}
+                        {{ row.owning_component }}
+                        {% elif row.still_missing %}
+                        <span class="pill status-critical">no owner</span>
+                        <div class="muted">Does not comply: collector requires openshift.io/owning-component</div>
+                        {% elif row.found %}
+                        {{ row.owning_component }}
+                        {% else %}
+                        —
+                        {% endif %}
+                    </td>
                     <td class="owner-cell">{% if row.owning_description %}{{ row.owning_description }}{% else %}—{% endif %}</td>
                 </tr>
                 {% endfor %}
             </tbody>
         </table>
-    </div>
-
-    <div id="tls-registry-panel" style="display: none;">
-        <details class="registry-owner">
-        <summary>Owned TLS artifacts by component ({{ tls_registry.owner_count }} owners, {{ tls_registry.artifact_count - tls_registry.missing_count }} owned) — ownership.md analogue</summary>
-        <div class="registry-body">
-        <p class="muted">Artifacts the OpenShift TLS collector accepted that already have
-            <code>openshift.io/owning-component</code>. Missing owners are <em>not</em> in this list;
-            use the <strong>Missing owners</strong> filter for those.
-            Node-disk copies are not included. JSON:
-            <a href="/api/tls-registry">/api/tls-registry</a>.</p>
-        {% for group in tls_registry.by_owner %}
-        <details class="registry-owner">
-            <summary>{{ group.owner }} ({{ group.count }})</summary>
-            <div class="registry-body">
-                {% if group.certificates %}
-                <p class="muted">Certificates ({{ group.certificates | length }})</p>
-                <table class="cert-table">
-                    <thead>
-                        <tr>
-                            <th class="row-num">#</th>
-                            <th>Namespace</th>
-                            <th>Secret</th>
-                            <th>Description</th>
-                        </tr>
-                    </thead>
-                    <tbody>
-                        {% for cert in group.certificates %}
-                        <tr>
-                            <td class="row-num">{{ loop.index }}</td>
-                            <td>{{ cert.namespace }}</td>
-                            <td>{{ cert.name }}</td>
-                            <td class="owner-cell">{% if cert.owning_description %}{{ cert.owning_description }}{% else %}—{% endif %}</td>
-                        </tr>
-                        {% endfor %}
-                    </tbody>
-                </table>
-                {% endif %}
-                {% if group.ca_bundles %}
-                <p class="muted">Certificate Authority Bundles ({{ group.ca_bundles | length }})</p>
-                <table class="cert-table">
-                    <thead>
-                        <tr>
-                            <th class="row-num">#</th>
-                            <th>Namespace</th>
-                            <th>ConfigMap</th>
-                            <th>Description</th>
-                        </tr>
-                    </thead>
-                    <tbody>
-                        {% for cert in group.ca_bundles %}
-                        <tr>
-                            <td class="row-num">{{ loop.index }}</td>
-                            <td>{{ cert.namespace }}</td>
-                            <td>{{ cert.name }}</td>
-                            <td class="owner-cell">{% if cert.owning_description %}{{ cert.owning_description }}{% else %}—{% endif %}</td>
-                        </tr>
-                        {% endfor %}
-                    </tbody>
-                </table>
-                {% endif %}
-            </div>
-        </details>
-        {% endfor %}
-        {% if not tls_registry.by_owner %}
-        <p class="muted">No owned TLS artifacts on this API.</p>
-        {% endif %}
-        </div>
-        </details>
     </div>
 
     <div class="section-title"><span id="cert-heading-label">Certificates</span> <span class="muted" id="visible-count"></span></div>
@@ -3240,13 +3170,15 @@ HTML_TEMPLATE = '''
                 <td class="owner-cell">
                     {% if cert.owning_component %}
                     {{ cert.owning_component }}
-                    {% elif cert.tls_registry_status == 'uncovered' %}
-                    <span class="pill status-warning">none</span>
-                    {% else %}
-                    —
-                    {% endif %}
                     {% if cert.owning_description %}
                     <div class="muted" title="{{ cert.owning_description }}">{{ cert.owning_description[:180] }}{% if cert.owning_description | length > 180 %}…{% endif %}</div>
+                    {% endif %}
+                    {% elif cert.needs_owning_component %}
+                    <span class="pill status-critical">no owner</span>
+                    <div class="muted">Does not comply: collector requires openshift.io/owning-component</div>
+                    {% else %}
+                    <span class="pill status-user">not required</span>
+                    <div class="muted">{{ cert.owner_not_required_reason }}</div>
                     {% endif %}
                 </td>
                 <td>
@@ -3315,7 +3247,7 @@ HTML_TEMPLATE = '''
                 <td>
                     {% if cert.tls_registry_status == 'uncovered' %}
                         {% if cert.known_origin_violation %}
-                        <span class="pill status-warning">no owner</span>
+                        <span class="pill status-critical">no owner</span>
                         <div class="muted">{{ 'CA bundle' if cert.origin_kind == 'ca-bundle' else (cert.origin_kind or 'artifact') }} · grandfathered (ownership.md remove-only)</div>
                         {% else %}
                         <span class="pill status-critical">no owner</span>
@@ -3375,8 +3307,6 @@ function applyFilter(name) {
   }
   var panel = document.getElementById('uncovered-panel');
   if (panel) panel.style.display = (name === 'uncovered') ? '' : 'none';
-  var treg = document.getElementById('tls-registry-panel');
-  if (treg) treg.style.display = (name === 'all') ? '' : 'none';
   var nrot = document.getElementById('norotate-panel');
   if (nrot) nrot.style.display = (name === 'tenyear') ? '' : 'none';
   var notes = document.querySelectorAll('[data-filter-note]');

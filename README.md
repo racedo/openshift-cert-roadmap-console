@@ -68,6 +68,7 @@ There is **no image build**. `./deploy.sh` loads `Container/app.py` into a Confi
 | `/healthz` | Probe |
 | `/api/workboard` | JSON of Features vs live examples |
 | `/api/certificates` | Full inventory JSON |
+| `/api/uncovered` | Missing-owner JSON (the grouped-by-component analogue is on [openshift-missing-owners](https://github.com/racedo/openshift-missing-owners)) |
 
 ## What the console maps
 
