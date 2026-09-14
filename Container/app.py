@@ -484,6 +484,9 @@ SCR_UNSHORTENED_10Y_SECRETS = frozenset({
     ('openshift-ovn-kubernetes', 'signer-ca'),
     ('openshift-network-node-identity', 'network-node-identity-ca'),
 })
+# These still auto-rotate (long cycle). They are OCPSTRAT-2272, not 1826.
+# MCS CA on some clusters uses CN=root-ca, which must not look like HyperShift oneshot.
+STILL_AUTO_ROTATES_10Y = frozenset(name for _ns, name in SCR_UNSHORTENED_10Y_SECRETS)
 SCR_UNSHORTENED_NAMESPACE_SECRETS = frozenset({
     ('openshift-ingress-operator', 'router-ca'),
     ('openshift-ingress', 'router-certs-default'),
@@ -754,7 +757,7 @@ def non_rotate_reason_for_cert(name, parsed):
     """Return reason if this PEM is a 10-year CA that OpenShift will not auto-rotate."""
     if not parsed or not is_ten_year_lifetime(parsed.get('validity_days')):
         return ''
-    if name in CNO_OPERATOR_PKI_SIGNERS:
+    if name in CNO_OPERATOR_PKI_SIGNERS or name in STILL_AUTO_ROTATES_10Y:
         return ''
     cn = subject_cn(parsed.get('subject'))
     if name in OCPSTRAT_1826_NO_ROTATE or cn in {
@@ -1070,7 +1073,7 @@ def classify_no_auto_rotate(name, cert_role, validity_days, injected_ca_copy,
     Exception: a dedicated leftover installer CA (single PEM, no private key)
     never rotates because the key was deleted with the bootstrap machine.
     """
-    if name in CNO_OPERATOR_PKI_SIGNERS:
+    if name in CNO_OPERATOR_PKI_SIGNERS or name in STILL_AUTO_ROTATES_10Y:
         return False, ''
     if injected_ca_copy:
         return False, ''
@@ -1669,6 +1672,19 @@ def summarize_certificates(certificates):
         'not_shortened_by_scr': sum(1 for c in certificates if c.get('not_shortened_by_scr')),
         'ocpstrat_1826': sum(1 for c in certificates if c.get('is_ocpstrat_1826')),
         'ocpstrat_1826_filter': sum(1 for c in certificates if c.get('filter_1826')),
+        'ocpstrat_1826_forever': sum(
+            1 for c in certificates if c.get('no_rotate_reason') == 'ocpstrat-1826'
+        ),
+        'ocpstrat_1826_installer': sum(
+            1 for c in certificates
+            if c.get('no_rotate_reason') in ('installer-10y', 'installer-10y-keyless')
+        ),
+        'ocpstrat_1826_hypershift': sum(
+            1 for c in certificates if c.get('no_rotate_reason') == 'hypershift-10y'
+        ),
+        'ocpstrat_1826_namespace': sum(
+            1 for c in certificates if c.get('scr_skip_kind') == 'namespace'
+        ),
         'below_4096_ca': sum(1 for c in certificates if c.get('key_policy') == 'below-4096-ca'),
         'past_rotate_at': sum(
             1 for c in certificates
@@ -1835,8 +1851,6 @@ WORK_TICKETS = {
     'installer-10y': ('OCPSTRAT-1826', JIRA_BROWSE + 'OCPSTRAT-1826'),
     'installer-10y-keyless': ('OCPSTRAT-1826', JIRA_BROWSE + 'OCPSTRAT-1826'),
     'hypershift-10y': ('OCPSTRAT-1826', JIRA_BROWSE + 'OCPSTRAT-1826'),
-    'scr-10y': ('OCPSTRAT-1826', JIRA_BROWSE + 'OCPSTRAT-1826'),
-    'scr-namespace': ('OCPSTRAT-1826', JIRA_BROWSE + 'OCPSTRAT-1826'),
     'rsa-ca-below-4096': ('OCPSTRAT-2271', JIRA_BROWSE + 'OCPSTRAT-2271'),
     'past-rotate-at': ('OCPSTRAT-1990', JIRA_BROWSE + 'OCPSTRAT-1990'),
     'validity-over-5y': ('OCPSTRAT-2272', JIRA_BROWSE + 'OCPSTRAT-2272'),
@@ -1848,7 +1862,7 @@ WORK_TICKETS = {
 WORK_ACTIONS = {
     'missing-owner-new': 'Set openshift.io/owning-component to the Jira component that owns this lifecycle. OpenShift CI fails on new unowned artifacts.',
     'missing-owner-known': 'Grandfathered OpenShift TLS-registry violation (remove-only). Still needs an owner; do not add more of these.',
-    'ocpstrat-1826': 'kube-apiserver foreverPeriod artifact. ShortCertRotation does not shorten 10y; the payload test skips it. No supported auto or manual rotation yet.',
+    'ocpstrat-1826': 'kube-apiserver foreverPeriod artifact. 10-year validity and no supported auto or manual rotation yet (OCPSTRAT-1826). ShortCertRotation does not shorten it.',
     'scr-10y': 'ShortCertRotation payload test skips ValidityDuration == "10y". This cert still auto-rotates on a long cycle (MCS ~8y, OVN/NNI ~9y).',
     'scr-namespace': 'Owning operator never wired ShortCertRotation (ingress / OLM). The payload test ignores this namespace. Typical lifetime ~2y; still auto-rotated.',
     'installer-10y': 'Installer created-once 10-year signer. Same rotation gap as OCPSTRAT-1826.',
@@ -1904,7 +1918,7 @@ TICKET_GROUP_URLS = {
     'No OCPSTRAT': '',
 }
 TICKET_GROUP_WHY = {
-    'OCPSTRAT-1826': 'Certs the ShortCertRotation payload test ignores: foreverPeriod (kube-apiserver 10y), other 10y ValidityDuration (MCS / OVN / NNI), and ingress/OLM namespaces. Auto-rotated leftovers stay listed; Management says who rotates.',
+    'OCPSTRAT-1826': '10-year certificates that will not auto-rotate (foreverPeriod, installer leftover CAs, HyperShift oneshot CAs).',
     'OCPSTRAT-2272': 'Listed items are examples on this API of why this Feature is important: platform certificates whose lifetime is still over 5 years.',
     'OCPSTRAT-2273': 'Listed items are examples on this API of why this Feature is important: platform certificates whose lifetime is still over 2 years (and at most 5).',
     'OCPSTRAT-2271': 'Listed items are examples on this API of why this Feature is important: RSA self-signed signers still below 4096 bits (GA is OCPSTRAT-3050).',
@@ -1983,9 +1997,7 @@ def apply_inventory_filter_flags(cert):
     """Flags for the Feature filter strip (must match visible inventory rows)."""
     if not cert:
         return cert
-    cert['filter_1826'] = bool(
-        cert.get('not_shortened_by_scr') or cert.get('will_not_auto_rotate')
-    )
+    cert['filter_1826'] = bool(cert.get('will_not_auto_rotate'))
     cert['filter_2272'] = (
         _has_key_not_bundle(cert) and (cert.get('validity_days') or 0) > POLICY_5Y_DAYS
     )
@@ -2031,12 +2043,9 @@ def hpstrat99_tracker(certificates, counts):
                 'url': JIRA_BROWSE + 'OCPSTRAT-1826',
                 'title': 'Manual rotation of 10-year certificates',
                 'filter': 'ocpstrat-1826',
-                'count': sum(
-                    1 for c in certificates
-                    if c.get('not_shortened_by_scr') or c.get('will_not_auto_rotate')
-                ),
+                'count': sum(1 for c in certificates if c.get('will_not_auto_rotate')),
                 'observable': True,
-                'gap': 'Secrets the ShortCertRotation payload test ignores (10y ValidityDuration including foreverPeriod, plus ingress/OLM namespaces). Auto-rotated leftovers stay in this count.',
+                'gap': '10-year certs that will not auto-rotate: kube-apiserver foreverPeriod, installer leftover CAs, HyperShift oneshot CAs. ShortCertRotation also skips foreverPeriod (10y). Auto-rotated 10y CAs (OVN, MCS, NNI) are OCPSTRAT-2272.',
             },
             {
                 'key': 'OCPSTRAT-2272',
@@ -2071,7 +2080,7 @@ def hpstrat99_tracker(certificates, counts):
                 'key': 'OCPSTRAT-2029',
                 'url': JIRA_BROWSE + 'OCPSTRAT-2029',
                 'title': 'External CA for platform certificates',
-                'filter': '',
+                'filter': 'ocpstrat-2029',
                 'count': None,
                 'observable': False,
                 'gap': 'Not a list of secrets. Until a customer intermediate CA is accepted at install, platform certs still chain only to OpenShift-internal roots. That missing capability does not show up as an issuer DN on this API.',
@@ -2093,7 +2102,7 @@ def hpstrat99_tracker(certificates, counts):
                 'key': 'OCPSTRAT-1346',
                 'url': JIRA_BROWSE + 'OCPSTRAT-1346',
                 'title': 'Automated node re-authentication after certificate expiry',
-                'filter': '',
+                'filter': 'ocpstrat-1346',
                 'count': None,
                 'observable': False,
                 'gap': 'Not visible from in-cluster PEMs (node CSR / hibernation recovery after kubelet cert expiry).',
@@ -2131,23 +2140,11 @@ def workboard_report(certificates):
             status='grandfathered' if known else 'new',
         ))
 
-    added_1826 = set()
     for c in certificates:
         if not c.get('will_not_auto_rotate'):
             continue
         why = c.get('no_rotate_reason') or 'will-not-rotate'
         items.append(_work_item(c, 'will-not-rotate', why, status='strategy'))
-        added_1826.add((c.get('namespace'), c.get('name')))
-
-    for c in certificates:
-        if not c.get('not_shortened_by_scr'):
-            continue
-        loc = (c.get('namespace'), c.get('name'))
-        if loc in added_1826:
-            continue
-        kind = c.get('scr_skip_kind') or ''
-        why = 'scr-namespace' if kind == 'namespace' else 'scr-10y'
-        items.append(_work_item(c, 'scr-test-skip', why, status='strategy'))
 
     rsa_by_fp = {}
     for c in certificates:
@@ -2326,7 +2323,6 @@ def index():
             if c.get('will_not_auto_rotate')
         ]
         ocpstrat_1826 = ocpstrat_1826_inventory(certificates)
-        scr_unshortened = short_cert_rotation_inventory(certificates)
         origin_expected, origin_new = origin_ownership_inventory(certificates)
         uncovered_certificates = [c for c in uncovered if c.get('origin_kind') == 'certificate']
         uncovered_ca_bundles = [c for c in uncovered if c.get('origin_kind') == 'ca-bundle']
@@ -2344,7 +2340,6 @@ def index():
             uncovered=uncovered,
             no_rotate=no_rotate,
             ocpstrat_1826=ocpstrat_1826,
-            scr_unshortened=scr_unshortened,
             origin_expected=origin_expected,
             origin_new=origin_new,
             uncovered_certificates=uncovered_certificates,
@@ -2670,6 +2665,9 @@ HTML_TEMPLATE = '''
             gap: 12px;
             margin: 20px 0;
         }
+        .filter-strips .filter-group-label { margin: 12px 0 6px; }
+        .filter-strips .filter-group-label:first-child { margin-top: 0; }
+        .filter-strips .summary { margin: 0 0 8px; }
         .summary-card {
             background: #FFFFFF;
             padding: 16px;
@@ -2690,6 +2688,17 @@ HTML_TEMPLATE = '''
             letter-spacing: 0.4px;
         }
         .summary-count { font-size: 2em; font-weight: 400; margin: 0; }
+        .summary-question {
+            font-size: 0.72em;
+            color: #6A6A6A;
+            font-weight: 400;
+            text-transform: none;
+            letter-spacing: 0;
+            line-height: 1.25;
+            min-height: 2.4em;
+            margin: 0 0 6px;
+        }
+        .summary-card.na .summary-count { font-size: 1.25em; color: #6A6A6A; }
         .filters { margin: 12px 0 20px; }
         .filters button {
             background: #FFFFFF;
@@ -2795,20 +2804,20 @@ HTML_TEMPLATE = '''
         .issuer-cell { max-width: 36em; word-break: break-word; }
         .issuer-cell code { font-size: 0.85em; display: block; }
         #inventory-table .col-evidence { display: none; }
-        #inventory-table.view-ocpstrat-1826 .col-evidence,
-        #inventory-table.view-uncovered .col-evidence,
+        #inventory-table[class*="view-ocpstrat-1826"] .col-evidence,
+        #inventory-table[class*="view-uncovered"] .col-evidence,
         #inventory-table.view-external .col-evidence,
         #inventory-table.view-ocpstrat-2271 .col-evidence,
         #inventory-table.view-ocpstrat-1990 .col-evidence,
         #inventory-table.view-usermanaged .col-evidence { display: table-cell; }
         #inventory-table .ev { display: none; }
-        #inventory-table.view-ocpstrat-1826 .ev-1826,
-        #inventory-table.view-uncovered .ev-uncovered,
+        #inventory-table[class*="view-ocpstrat-1826"] .ev-1826,
+        #inventory-table[class*="view-uncovered"] .ev-uncovered,
         #inventory-table.view-external .ev-external,
         #inventory-table.view-ocpstrat-2271 .ev-2271,
         #inventory-table.view-ocpstrat-1990 .ev-1990,
         #inventory-table.view-usermanaged .ev-usermanaged { display: block; }
-        #inventory-table.view-ocpstrat-1826 .gap-pill { display: none; }
+        #inventory-table[class*="view-ocpstrat-1826"] .gap-pill { display: none; }
         .filter-group-label {
             font-size: 0.75em;
             font-weight: 600;
@@ -2849,8 +2858,8 @@ HTML_TEMPLATE = '''
         <h1>Certificate Roadmap Console</h1>
         <p>For OpenShift PMs and engineers: this cluster is the evidence for
             <a href="https://issues.redhat.com/browse/HPSTRAT-99" target="_blank" rel="noopener noreferrer">HPSTRAT-99</a>.
-            Click a Feature count or a filter card — same control. Inventory columns stay
-            put; the Evidence column changes with the Feature.</p>
+            Click a Feature card to see which certs that missing Feature would
+            change. Columns stay put; Evidence changes with the Feature.</p>
         <div class="info-box">
             <strong>Generated:</strong> {{ generated_time }} &nbsp;|&nbsp; <strong>Cluster:</strong> {{ cluster_name }}
             {% if control_plane_topology %}&nbsp;|&nbsp; <strong>Control plane:</strong> {{ control_plane_topology }}{% endif %}
@@ -2859,7 +2868,7 @@ HTML_TEMPLATE = '''
             &nbsp;|&nbsp; <a href="/api/uncovered">Missing-owner API</a>
         </div>
         <details class="glossary">
-            <summary>Glossary — TLS registry, signer, CA, PEM, leaf, rotation, foreverPeriod, ShortCertRotation, owning component</summary>
+            <summary>Glossary — TLS registry, signer, CA, PEM, leaf, rotation, foreverPeriod, ShortCertRotation, owning component, grandfathered</summary>
             <div class="glossary-body">
                 <p class="muted">Collapsed until you need it. Same words appear as filters and column values.</p>
                 <dl>
@@ -2954,14 +2963,28 @@ HTML_TEMPLATE = '''
                         kube-apiserver <code>foreverPeriod</code> (10y). The payload test then skips any
                         remaining <code>ValidityDuration == "10y"</code> certs, and separately ignores
                         ingress and OLM namespaces whose operators never wired the gate.
-                        <a href="https://issues.redhat.com/browse/OCPSTRAT-1826" target="_blank" rel="noopener noreferrer">OCPSTRAT-1826</a>
-                        on this console is the live list of certs that test ignores
-                        (foreverPeriod, other 10y, ingress/OLM). Management still shows
-                        which of those auto-rotate.
-                        <span class="use">Used for: the OCPSTRAT-1826 filter — which certs the ShortCertRotation payload test ignores.</span></dd>
+                        That skip list is not
+                        <a href="https://issues.redhat.com/browse/OCPSTRAT-1826" target="_blank" rel="noopener noreferrer">OCPSTRAT-1826</a>:
+                        1826 is 10-year certs that will not auto-rotate. OVN, MCS, and NNI CAs
+                        still auto-rotate on a long cycle and belong on
+                        <a href="https://issues.redhat.com/browse/OCPSTRAT-2272" target="_blank" rel="noopener noreferrer">OCPSTRAT-2272</a>;
+                        ingress/OLM leftovers (~2y) belong on
+                        <a href="https://issues.redhat.com/browse/OCPSTRAT-2273" target="_blank" rel="noopener noreferrer">OCPSTRAT-2273</a>.
+                        <span class="use">Used for: payload tests that need to observe rotation in hours.</span></dd>
                     <dt>Owning component</dt>
                     <dd>The Jira component in <code>openshift.io/owning-component</code>. The OpenShift TLS registry requires this on every collected artifact so cert bugs route to a team.
                         <span class="use">Used for: assigning ownership. Empty means Missing Owner — OpenShift CI blocks new ones; five grandfathered ingress/kube-system gaps remain.</span></dd>
+                    <dt>Grandfathered</dt>
+                    <dd>A missing owner that OpenShift CI already knew about and does not fail the payload job for.
+                        The TLS-registry ownership snapshot lists five <em>remove-only</em> names in
+                        <a href="https://github.com/openshift/origin/blob/main/tls/ownership/ownership.md" target="_blank" rel="noopener noreferrer">ownership.md</a>:
+                        <code>router-certs-default</code> and <code>router-ca</code> (ingress),
+                        <code>extension-apiserver-authentication</code> (<code>kube-system</code>),
+                        and <code>default-ingress-cert</code> in <code>openshift-config-managed</code> and
+                        <code>openshift-console</code>. They still need an owning-component; the list must not grow.
+                        Every other empty owner is <strong>new</strong> and fails CI (often optional operators in
+                        <code>openshift-*</code>, for example OpenShift Virtualization).
+                        <span class="use">Used for: the OCPSTRAT-2655 missing-owner filter — new vs grandfathered in the Evidence column.</span></dd>
                     <dt>Description</dt>
                     <dd>The <code>openshift.io/description</code> annotation: API-docs style text for what the artifact is (who it authenticates, what it signs, which names it terminates).
                         <span class="use">Used for: telling a human (and this console) what the cert or CA bundle is for, not who owns the bug.</span></dd>
@@ -2991,264 +3014,125 @@ HTML_TEMPLATE = '''
         {% endif %}
     </div>
 
-    <div id="workboard-panel">
-        {% if workboard and workboard.hpstrat99 %}
-        <div class="section-title">HPSTRAT-99 — OpenShift product gaps on this cluster</div>
-        <p class="muted">
-            Outcome:
-            <a href="{{ workboard.hpstrat99.outcome.url }}" target="_blank" rel="noopener noreferrer">{{ workboard.hpstrat99.outcome.key }}</a>
-            {{ workboard.hpstrat99.outcome.title }}.
-            Child Features below are the work the product team still has to ship.
-            Open a Feature in Jira for its current status and priority.
-            <strong>On this cluster</strong> is how many live gaps this console can see for that Feature.
-        </p>
-        <table class="cert-table" id="hpstrat99-table">
-            <thead>
-                <tr>
-                    <th>Feature</th>
-                    <th>On this cluster</th>
-                    <th>What we measure</th>
-                </tr>
-            </thead>
-            <tbody>
-                {% for feat in workboard.hpstrat99.features %}
-                <tr {% if feat.filter %}class="filter-jump" data-filter="{{ feat.filter }}" onclick="applyFilter('{{ feat.filter }}')"{% endif %}>
-                    <td>
-                        <a href="{{ feat.url }}" target="_blank" rel="noopener noreferrer" onclick="event.stopPropagation()"><code>{{ feat.key }}</code></a>
-                        {% if feat.also_key %}
-                        · <a href="{{ feat.also_url }}" target="_blank" rel="noopener noreferrer" onclick="event.stopPropagation()"><code>{{ feat.also_key }}</code></a>
-                        {% endif %}
-                        <div>{{ feat.title }}</div>
-                    </td>
-                    <td>
-                        {% if not feat.observable %}
-                        <span class="pill status-user">not in API PEMs</span>
-                        {% elif feat.count == 0 %}
-                        <span class="pill status-good">0</span>
-                        {% else %}
-                        <span class="pill status-critical">{{ feat.count }}</span>
-                        {% endif %}
-                    </td>
-                    <td class="owner-cell">{{ feat.gap }}</td>
-                </tr>
-                {% endfor %}
-            </tbody>
-        </table>
-        {% endif %}
-
-        <div class="section-title">What to fix (by OCPSTRAT)</div>
-        <p class="muted">Every Feature stays listed even when this API has 0 matching rows (common on hosted guests).
-            Rows under a Feature are examples on this API of why that work matters — for example, certificates already past rotate-at.
-            <a href="https://issues.redhat.com/browse/OCPSTRAT-2029" target="_blank" rel="noopener noreferrer">OCPSTRAT-2029</a>
-            is missing product capability (customer intermediate CA), not a PEM list.
-            Owning component is <code>openshift.io/owning-component</code>
-            (required on collector-accepted platform TLS artifacts; otherwise labeled not required).
-            CA-bundle copies of the same 10-year CA are not listed.
-            JSON: <a href="/api/workboard">/api/workboard</a>.</p>
-        {% if workboard and workboard.by_ticket %}
-        <p>
-            <strong>{{ workboard.total }}</strong> example items on this API
-            · {{ workboard.ticket_count }} Features listed
-        </p>
-        {% for group in workboard.by_ticket %}
-        <details class="registry-owner">
-            <summary>
-                {% if group.ticket_url %}
-                <a href="{{ group.ticket_url }}" target="_blank" rel="noopener noreferrer" onclick="event.stopPropagation()">{{ group.ticket }}</a>
-                {% else %}{{ group.ticket }}{% endif %}
-                — {{ group.title }} ({{ group.count }})
-            </summary>
-            <div class="registry-body">
-                {% if group.why %}<p class="muted">{{ group.why }}</p>{% endif %}
-                {% if group.gaps %}
-                <table class="cert-table">
-                    <thead>
-                        <tr>
-                            <th class="row-num">#</th>
-                            {% if group.ticket != 'OCPSTRAT-2271' %}
-                            <th>Owning component</th>
-                            {% endif %}
-                            <th>Namespace</th>
-                            <th>Name</th>
-                            {% if group.ticket == 'OCPSTRAT-1826' %}
-                            <th>Why the SCR test skips</th>
-                            {% endif %}
-                            {% if group.ticket == 'OpenShift CI' %}
-                            <th>New vs grandfathered</th>
-                            {% endif %}
-                            {% if group.ticket == 'OCPSTRAT-2029' %}
-                            <th>Issuer</th>
-                            {% endif %}
-                            {% if group.ticket != 'OCPSTRAT-2271' %}
-                            <th>Role</th>
-                            <th>Validity</th>
-                            {% endif %}
-                            {% if group.ticket == 'OCPSTRAT-2271' %}
-                            <th>Key type</th>
-                            <th>Key size</th>
-                            {% endif %}
-                            {% if group.ticket == 'OCPSTRAT-1990' %}
-                            <th class="has-tip" title="When the operator is expected to refresh this cert (certificates.openshift.io/refresh-period, CNO 9y, or library-go 80% of lifetime).">Rotate-at</th>
-                            {% endif %}
-                        </tr>
-                    </thead>
-                    <tbody>
-                        {% for item in group.gaps %}
-                        <tr>
-                            <td class="row-num">{{ loop.index }}</td>
-                            {% if group.ticket != 'OCPSTRAT-2271' %}
-                            <td class="owner-cell">
-                                {% if item.owning_component %}
-                                {{ item.owning_component }}
-                                {% elif item.needs_owning_component %}
-                                <span class="pill status-critical">no owner</span>
-                                {% else %}
-                                <span class="pill status-user">not required</span>
-                                {% endif %}
-                            </td>
-                            {% endif %}
-                            <td>{{ item.namespace }}</td>
-                            <td><code>{{ item.name }}</code>
-                                {% if item.is_forever_period %}
-                                <div><span class="pill status-critical">foreverPeriod</span></div>
-                                {% endif %}
-                                {% if item.copy_count and item.copy_count > 1 %}
-                                <div class="muted">{{ item.copy_count }} copies of this certificate</div>
-                                {% endif %}
-                                {% if item.installer_ca_lifecycle == 'keep-recovery' %}
-                                <div class="muted">Keep: original admin kubeconfig CA</div>
-                                {% elif item.installer_ca_lifecycle == 'revocable-bootstrap' %}
-                                <div class="muted">Revocable leftover master-bootstrap CA</div>
-                                {% endif %}
-                            </td>
-                            {% if group.ticket == 'OCPSTRAT-1826' %}
-                            <td class="owner-cell">
-                                {% if item.scr_skip_kind == 'foreverPeriod' %}
-                                <span class="pill status-critical">foreverPeriod</span>
-                                {% elif item.scr_skip_kind == '10y' %}
-                                <span class="pill status-warning">10y skip</span>
-                                {% elif item.scr_skip_kind == 'namespace' %}
-                                <span class="pill status-user">namespace skip</span>
-                                {% elif item.category == 'will-not-rotate' %}
-                                <span class="pill status-critical">will not auto-rotate</span>
-                                {% endif %}
-                                {% if item.scr_skip_label %}
-                                <div class="muted">{{ item.scr_skip_label }}</div>
-                                {% endif %}
-                            </td>
-                            {% endif %}
-                            {% if group.ticket == 'OpenShift CI' %}
-                            <td>
-                                {% if item.status == 'grandfathered' %}
-                                <span class="pill status-warning">grandfathered</span>
-                                {% else %}
-                                <span class="pill status-critical">new</span>
-                                {% endif %}
-                            </td>
-                            {% endif %}
-                            {% if group.ticket == 'OCPSTRAT-2029' %}
-                            <td class="owner-cell">{% if item.issuer %}<code>{{ item.issuer }}</code>{% else %}—{% endif %}</td>
-                            {% endif %}
-                            {% if group.ticket != 'OCPSTRAT-2271' %}
-                            <td>{{ item.role or '—' }}</td>
-                            <td>{{ item.validity_label or '—' }}</td>
-                            {% endif %}
-                            {% if group.ticket == 'OCPSTRAT-2271' %}
-                            <td>{{ item.key_type or '—' }}</td>
-                            <td>{% if item.key_size %}<span class="pill status-critical">{{ item.key_size }} bits</span>{% else %}—{% endif %}</td>
-                            {% endif %}
-                            {% if group.ticket == 'OCPSTRAT-1990' %}
-                            <td>{% if item.rotate_at %}{{ item.rotate_at }}
-                                {% if item.rotate_at_source %}<div class="muted">{{ item.rotate_at_source }}{% if item.days_until_rotate is not none %} · {{ item.days_until_rotate }}d{% endif %}</div>{% endif %}
-                                {% else %}—{% endif %}</td>
-                            {% endif %}
-                        </tr>
-                        {% endfor %}
-                    </tbody>
-                </table>
-                {% else %}
-                {% if group.ticket == 'OCPSTRAT-2029' %}
-                <div class="ok-box">Not a to-do list of secrets. This Feature is missing product capability
-                    (accept a customer intermediate CA at install), not a set of PEMs to re-issue.
-                    Operator-local CAs and proxy trust bundles stay on the External issuers filter;
-                    they are out of scope for the intermediate CA.</div>
-                {% else %}
-                <div class="ok-box">No examples on this API.</div>
-                {% endif %}
-                {% endif %}
+    <div id="workboard-panel" class="filter-strips">
+        <div class="filter-group-label">HPSTRAT-99 Features — click to see impacted certs</div>
+        <div class="summary feature-filters">
+            <div class="summary-card" data-filter="ocpstrat-1826" onclick="applyFilter('ocpstrat-1826')">
+                <h3>OCPSTRAT-1826</h3>
+                <div class="summary-question">10y certs that will not auto-rotate</div>
+                <div class="summary-count" style="color: #721C24;">{{ summary.ocpstrat_1826_filter }}</div>
             </div>
-        </details>
-        {% endfor %}
-        {% else %}
-        <div class="ok-box">No product-team gaps on this API.</div>
-        {% endif %}
-    </div>
+            <div class="summary-card" data-filter="ocpstrat-2272" onclick="applyFilter('ocpstrat-2272')">
+                <h3>OCPSTRAT-2272</h3>
+                <div class="summary-question">Platform certs with validity over 5 years</div>
+                <div class="summary-count" style="color: #721C24;">{{ summary.validity_over_5y }}</div>
+            </div>
+            <div class="summary-card" data-filter="ocpstrat-2273" onclick="applyFilter('ocpstrat-2273')">
+                <h3>OCPSTRAT-2273</h3>
+                <div class="summary-question">Platform certs with validity 2–5 years</div>
+                <div class="summary-count">{{ summary.validity_over_2y }}</div>
+            </div>
+            <div class="summary-card" data-filter="ocpstrat-2271" onclick="applyFilter('ocpstrat-2271')">
+                <h3>OCPSTRAT-2271 / 3050</h3>
+                <div class="summary-question">RSA CA keys still below 4096 bits</div>
+                <div class="summary-count" style="color: #721C24;">{{ summary.below_4096_ca }}</div>
+            </div>
+            <div class="summary-card" data-filter="ocpstrat-1990" onclick="applyFilter('ocpstrat-1990')">
+                <h3>OCPSTRAT-1990</h3>
+                <div class="summary-question">Secrets already past predicted rotate-at</div>
+                <div class="summary-count">{{ summary.past_rotate_at }}</div>
+            </div>
+            <div class="summary-card" data-filter="uncovered" onclick="applyFilter('uncovered')">
+                <h3>OCPSTRAT-2655</h3>
+                <div class="summary-question">Missing openshift.io/owning-component</div>
+                <div class="summary-count" style="color: #856404;">{{ summary.uncovered }}</div>
+            </div>
+            <div class="summary-card na" data-filter="ocpstrat-2029" onclick="applyFilter('ocpstrat-2029')">
+                <h3>OCPSTRAT-2029</h3>
+                <div class="summary-question">Customer intermediate CA (not in API PEMs)</div>
+                <div class="summary-count">n/a</div>
+            </div>
+            <div class="summary-card na" data-filter="ocpstrat-1346" onclick="applyFilter('ocpstrat-1346')">
+                <h3>OCPSTRAT-1346</h3>
+                <div class="summary-question">Node re-auth after expiry (not in API PEMs)</div>
+                <div class="summary-count">n/a</div>
+            </div>
+        </div>
 
-    <div class="filter-group-label">Features (HPSTRAT-99)</div>
-    <div class="summary">
-        <div class="summary-card" data-filter="ocpstrat-1826" onclick="applyFilter('ocpstrat-1826')">
-            <h3>OCPSTRAT-1826</h3>
-            <div class="summary-count" style="color: #721C24;">{{ summary.ocpstrat_1826_filter }}</div>
+        <div class="filter-group-label">Inventory</div>
+        <div class="summary">
+            <div class="summary-card active" data-filter="all" onclick="applyFilter('all')">
+                <h3>Total</h3>
+                <div class="summary-count">{{ summary.total }}</div>
+            </div>
+            <div class="summary-card" data-filter="signer" onclick="applyFilter('signer')">
+                <h3>Signers</h3>
+                <div class="summary-count">{{ summary.signers }}</div>
+            </div>
+            <div class="summary-card" data-filter="leaf" onclick="applyFilter('leaf')">
+                <h3>Leaves</h3>
+                <div class="summary-count">{{ summary.leaves }}</div>
+            </div>
+            <div class="summary-card" data-filter="external" onclick="applyFilter('external')">
+                <h3>External issuers</h3>
+                <div class="summary-count" style="color: #0056B3;">{{ summary.external_issuers }}</div>
+            </div>
+            <div class="summary-card" data-filter="usermanaged" onclick="applyFilter('usermanaged')">
+                <h3>User-managed</h3>
+                <div class="summary-count" style="color: #721C24;">{{ summary.user_managed }}</div>
+            </div>
         </div>
-        <div class="summary-card" data-filter="ocpstrat-2272" onclick="applyFilter('ocpstrat-2272')">
-            <h3>OCPSTRAT-2272</h3>
-            <div class="summary-count" style="color: #721C24;">{{ summary.validity_over_5y }}</div>
+
+        <div id="1826-subfilters" class="filters" style="display: none;">
+            <span class="muted">OCPSTRAT-1826 questions:</span>
+            <button type="button" data-filter="ocpstrat-1826" onclick="applyFilter('ocpstrat-1826')">All {{ summary.ocpstrat_1826_filter }}</button>
+            <button type="button" data-filter="ocpstrat-1826-forever" onclick="applyFilter('ocpstrat-1826-forever')">foreverPeriod {{ summary.ocpstrat_1826_forever }}</button>
+            <button type="button" data-filter="ocpstrat-1826-installer" onclick="applyFilter('ocpstrat-1826-installer')">installer leftover {{ summary.ocpstrat_1826_installer }}</button>
+            <button type="button" data-filter="ocpstrat-1826-hypershift" onclick="applyFilter('ocpstrat-1826-hypershift')">HyperShift 10y {{ summary.ocpstrat_1826_hypershift }}</button>
+            <button type="button" data-filter="ocpstrat-1826-namespace" onclick="applyFilter('ocpstrat-1826-namespace')">SCR namespace skip {{ summary.ocpstrat_1826_namespace }}</button>
         </div>
-        <div class="summary-card" data-filter="ocpstrat-2273" onclick="applyFilter('ocpstrat-2273')">
-            <h3>OCPSTRAT-2273</h3>
-            <div class="summary-count">{{ summary.validity_over_2y }}</div>
-        </div>
-        <div class="summary-card" data-filter="ocpstrat-2271" onclick="applyFilter('ocpstrat-2271')">
-            <h3>OCPSTRAT-2271</h3>
-            <div class="summary-count" style="color: #721C24;">{{ summary.below_4096_ca }}</div>
-        </div>
-        <div class="summary-card" data-filter="ocpstrat-1990" onclick="applyFilter('ocpstrat-1990')">
-            <h3>OCPSTRAT-1990</h3>
-            <div class="summary-count">{{ summary.past_rotate_at }}</div>
-        </div>
-        <div class="summary-card" data-filter="uncovered" onclick="applyFilter('uncovered')">
-            <h3>Missing owners</h3>
-            <div class="summary-count" style="color: #856404;">{{ summary.uncovered }}</div>
-        </div>
-        <div class="summary-card" data-filter="usermanaged" onclick="applyFilter('usermanaged')">
-            <h3>User-managed</h3>
-            <div class="summary-count" style="color: #721C24;">{{ summary.user_managed }}</div>
-        </div>
-    </div>
-    <div class="filter-group-label">Inventory</div>
-    <div class="summary">
-        <div class="summary-card active" data-filter="all" onclick="applyFilter('all')">
-            <h3>Total</h3>
-            <div class="summary-count">{{ summary.total }}</div>
-        </div>
-        <div class="summary-card" data-filter="signer" onclick="applyFilter('signer')">
-            <h3>Signers</h3>
-            <div class="summary-count">{{ summary.signers }}</div>
-        </div>
-        <div class="summary-card" data-filter="leaf" onclick="applyFilter('leaf')">
-            <h3>Leaves</h3>
-            <div class="summary-count">{{ summary.leaves }}</div>
-        </div>
-        <div class="summary-card" data-filter="external" onclick="applyFilter('external')">
-            <h3>External issuers</h3>
-            <div class="summary-count" style="color: #0056B3;">{{ summary.external_issuers }}</div>
+        <div id="2655-subfilters" class="filters" style="display: none;">
+            <span class="muted">OCPSTRAT-2655 questions:</span>
+            <button type="button" data-filter="uncovered" onclick="applyFilter('uncovered')">All {{ summary.uncovered }}</button>
+            <button type="button" data-filter="uncovered-new" onclick="applyFilter('uncovered-new')">new (CI fails) {{ summary.missing_owners_new }}</button>
+            <button type="button" data-filter="uncovered-known" onclick="applyFilter('uncovered-known')">grandfathered {{ summary.missing_owners_known }}</button>
         </div>
     </div>
 
     <div id="filter-notes">
         <div class="info-box filter-note" data-filter-note="all">
-            Platform certs should rotate before they expire. Feature cards are the
-            HPSTRAT-99 gaps on this API. <strong>Validity</strong> is lifetime
-            (<code>notAfter − notBefore</code>), not days left.
+            Feature cards answer the HPSTRAT-99 questions on this API.
+            Inventory cards are the full catalog (role / issuer / user-managed).
+            <strong>Validity</strong> is lifetime (<code>notAfter − notBefore</code>), not days left.
         </div>
         <div class="warn-box filter-note" data-filter-note="ocpstrat-1826" style="display: none;">
             <a href="https://issues.redhat.com/browse/OCPSTRAT-1826" target="_blank" rel="noopener noreferrer">OCPSTRAT-1826</a>:
-            certs the ShortCertRotation payload test ignores.
-            Skip kinds: <code>foreverPeriod</code> (kube-apiserver 10y),
-            <code>10y</code> ValidityDuration (MCS / OVN / NNI),
-            <code>namespace</code> (ingress / OLM).
-            Auto-rotated leftovers stay listed — Management says who rotates.
-            Installer 10y leftovers also hit the 10y skip.
+            10-year certs that will not auto-rotate — kube-apiserver
+            <code>foreverPeriod</code>, installer leftover CAs, HyperShift oneshot CAs.
+            Use the question buttons to split foreverPeriod, installer leftovers, and HyperShift 10y CAs.
+            <strong>SCR namespace skip</strong> is a related leftover: ingress / OLM never wired ShortCertRotation
+            (still auto-rotated, typically ~2y). Auto-rotated 10y CAs (OVN, MCS, NNI) are
+            <a href="https://issues.redhat.com/browse/OCPSTRAT-2272" target="_blank" rel="noopener noreferrer">OCPSTRAT-2272</a>.
+        </div>
+        <div class="warn-box filter-note" data-filter-note="ocpstrat-1826-forever" style="display: none;">
+            <a href="https://issues.redhat.com/browse/OCPSTRAT-1826" target="_blank" rel="noopener noreferrer">OCPSTRAT-1826</a>
+            question 1: kube-apiserver <code>foreverPeriod</code> secrets (four serving signers + recovery certkey).
+        </div>
+        <div class="warn-box filter-note" data-filter-note="ocpstrat-1826-installer" style="display: none;">
+            <a href="https://issues.redhat.com/browse/OCPSTRAT-1826" target="_blank" rel="noopener noreferrer">OCPSTRAT-1826</a>
+            question 2: installer leftover 10y CAs (<code>admin-kubeconfig-signer</code>,
+            <code>kubelet-bootstrap-kubeconfig-signer</code>), including keyless copies.
+        </div>
+        <div class="warn-box filter-note" data-filter-note="ocpstrat-1826-hypershift" style="display: none;">
+            <a href="https://issues.redhat.com/browse/OCPSTRAT-1826" target="_blank" rel="noopener noreferrer">OCPSTRAT-1826</a>
+            question 3: HyperShift oneshot 10y CAs (private key still on this API).
+        </div>
+        <div class="warn-box filter-note" data-filter-note="ocpstrat-1826-namespace" style="display: none;">
+            <a href="https://issues.redhat.com/browse/OCPSTRAT-1826" target="_blank" rel="noopener noreferrer">OCPSTRAT-1826</a>
+            related: ShortCertRotation is not honored because the owning operator never wired the
+            feature gate in this namespace (ingress <code>router-ca</code> /
+            <code>router-certs-default</code>, OLM <code>packageserver-service-cert</code>).
+            These still auto-rotate (typically ~2y). They are not the 10y will-not-rotate set.
         </div>
         <div class="warn-box filter-note" data-filter-note="ocpstrat-2272" style="display: none;">
             <a href="https://issues.redhat.com/browse/OCPSTRAT-2272" target="_blank" rel="noopener noreferrer">OCPSTRAT-2272</a>
@@ -3269,10 +3153,29 @@ HTML_TEMPLATE = '''
             (not will-not-rotate, not user-managed, not CA-bundle copies).
         </div>
         <div class="warn-box filter-note" data-filter-note="uncovered" style="display: none;">
+            <a href="https://issues.redhat.com/browse/OCPSTRAT-2655" target="_blank" rel="noopener noreferrer">OCPSTRAT-2655</a>:
             TLS collector would accept this object and
             <code>openshift.io/owning-component</code> is empty.
-            Evidence: new (CI fails) vs grandfathered (five remove-only names).
+            Use the question buttons for new (CI fails) vs grandfathered (five remove-only names).
             {{ summary.missing_owners_new }} new, {{ summary.missing_owners_known }} grandfathered.
+        </div>
+        <div class="warn-box filter-note" data-filter-note="uncovered-new" style="display: none;">
+            <a href="https://issues.redhat.com/browse/OCPSTRAT-2655" target="_blank" rel="noopener noreferrer">OCPSTRAT-2655</a>
+            question 1: new missing owners — OpenShift CI fails on these.
+        </div>
+        <div class="warn-box filter-note" data-filter-note="uncovered-known" style="display: none;">
+            <a href="https://issues.redhat.com/browse/OCPSTRAT-2655" target="_blank" rel="noopener noreferrer">OCPSTRAT-2655</a>
+            question 2: grandfathered missing owners (five remove-only names).
+        </div>
+        <div class="warn-box filter-note" data-filter-note="ocpstrat-2029" style="display: none;">
+            <a href="https://issues.redhat.com/browse/OCPSTRAT-2029" target="_blank" rel="noopener noreferrer">OCPSTRAT-2029</a>
+            is missing product capability (accept a customer intermediate CA at install).
+            That gap is not a list of secrets on this API. External issuers in Inventory are
+            operator-local / proxy trust bundles, not this Feature.
+        </div>
+        <div class="warn-box filter-note" data-filter-note="ocpstrat-1346" style="display: none;">
+            <a href="https://issues.redhat.com/browse/OCPSTRAT-1346" target="_blank" rel="noopener noreferrer">OCPSTRAT-1346</a>
+            (node re-authentication after kubelet cert expiry) is not visible from in-cluster PEMs.
         </div>
         <div class="info-box filter-note" data-filter-note="signer" style="display: none;">
             CAs that issue other certificates. Most rotate at 80% of validity.
@@ -3294,24 +3197,22 @@ HTML_TEMPLATE = '''
         </div>
     </div>
 
-    <div id="scr-panel" style="display: none;">
-        <div class="section-title">Named secrets the ShortCertRotation test ignores</div>
-        <p class="muted">Presence checklist for the operator-wiring set. Skip kind is
-            foreverPeriod, 10y, or namespace. Hosted guests usually lack foreverPeriod
-            secrets (they live on the management cluster). Inventory rows below include
-            installer 10y leftovers that also hit the 10y skip.</p>
-        <table class="cert-table" id="scr-unshortened-table">
+    <div id="norotate-panel" style="display: none;">
+        <div class="section-title">Named foreverPeriod secrets (live check)</div>
+        <p class="muted">The five kube-apiserver <code>foreverPeriod</code> secrets.
+            Present on standalone/management; on a hosted guest they live on the
+            management cluster. Installer and HyperShift 10y CAs are in the table below.</p>
+        <table class="cert-table" id="ocpstrat-1826-table">
             <thead>
                 <tr>
                     <th class="row-num">#</th>
                     <th>Secret</th>
                     <th>Namespace</th>
-                    <th>Skip kind</th>
                     <th>On this API</th>
                 </tr>
             </thead>
             <tbody>
-                {% for row in scr_unshortened %}
+                {% for row in ocpstrat_1826 %}
                 <tr>
                     <td class="row-num">{{ loop.index }}</td>
                     <td><code>{{ row.name }}</code>
@@ -3319,20 +3220,11 @@ HTML_TEMPLATE = '''
                         <div class="muted">{{ row.revision_count }} objects (includes static-pod revisions)</div>
                         {% endif %}
                     </td>
-                    <td>{{ row.namespace }}</td>
-                    <td>
-                        {% if row.skip_kind == 'foreverPeriod' %}
-                        <span class="pill status-critical">foreverPeriod</span>
-                        {% elif row.skip_kind == '10y' %}
-                        <span class="pill status-warning">10y</span>
-                        {% else %}
-                        <span class="pill status-user">namespace</span>
-                        {% endif %}
-                    </td>
+                    <td>{% if row.namespaces %}{{ row.namespaces | join(', ') }}{% else %}—{% endif %}</td>
                     <td>
                         {% if row.found %}
                         <span class="pill status-info">present</span>
-                        {% elif hosted_guest and row.skip_kind == 'foreverPeriod' %}
+                        {% elif hosted_guest %}
                         <span class="pill status-user">not on this API</span>
                         {% else %}
                         <span class="pill status-warning">not on this API</span>
@@ -3405,11 +3297,14 @@ HTML_TEMPLATE = '''
                 data-registry="{{ cert.tls_registry_status }}"
                 data-origin="{{ cert.issuer_origin }}"
                 data-1826="{{ '1' if cert.filter_1826 else '0' }}"
+                data-1826-reason="{{ cert.no_rotate_reason or '' }}"
+                data-scr-skip="{{ cert.scr_skip_kind or '' }}"
                 data-2272="{{ '1' if cert.filter_2272 else '0' }}"
                 data-2273="{{ '1' if cert.filter_2273 else '0' }}"
                 data-keypolicy="{{ cert.key_policy }}"
                 data-pastrotate="{{ '1' if cert.days_until_rotate is not none and cert.days_until_rotate < 0 and not cert.will_not_auto_rotate and cert.has_private_key and cert.cert_role != 'ca-bundle' and not cert.injected_ca_copy else '0' }}"
                 data-usermanaged="{{ '1' if 'User-Managed' in cert.managed_status else '0' }}"
+                data-known="{{ '1' if cert.known_origin_violation else '0' }}"
             >
                 <td class="row-num"></td>
                 <td>{{ cert.name }}
@@ -3432,9 +3327,7 @@ HTML_TEMPLATE = '''
                     <div class="muted">Revocable leftover master-bootstrap CA</div>
                     {% endif %}
                     {% if cert.owning_description %}
-                    <details><summary>Description</summary>
                     <div class="muted">{{ cert.owning_description }}</div>
-                    </details>
                     {% endif %}
                 </td>
                 <td>{{ cert.namespace }}</td>
@@ -3470,21 +3363,22 @@ HTML_TEMPLATE = '''
                 </td>
                 <td class="col-evidence">
                     <div class="ev ev-1826">
-                        {% if cert.scr_skip_kind == 'foreverPeriod' %}
-                        <span class="pill status-critical">foreverPeriod</span>
-                        {% elif cert.scr_skip_kind == '10y' %}
-                        <span class="pill status-warning">10y skip</span>
-                        {% elif cert.scr_skip_kind == 'namespace' %}
+                        {% if cert.scr_skip_kind == 'namespace' %}
                         <span class="pill status-user">namespace skip</span>
-                        {% elif cert.will_not_auto_rotate %}
-                        <span class="pill status-critical">will not auto-rotate</span>
-                        {% else %}
-                        —
-                        {% endif %}
-                        {% if cert.scr_skip_label %}
                         <div class="muted">{{ cert.scr_skip_label }}</div>
+                        {% elif cert.is_forever_period %}
+                        <span class="pill status-critical">foreverPeriod</span>
+                        <div class="muted">10y · no supported rotation</div>
+                        <div class="muted">ShortCertRotation payload test skips 10y ValidityDuration</div>
                         {% elif cert.no_rotate_label %}
-                        <div class="muted">{{ cert.no_rotate_label }}</div>
+                        <span class="pill status-critical">{{ cert.no_rotate_label }}</span>
+                        <div class="muted">10y · no supported rotation</div>
+                        {% else %}
+                        <span class="pill status-critical">will not auto-rotate</span>
+                        <div class="muted">10y · no supported rotation</div>
+                        {% endif %}
+                        {% if cert.installer_ca_note %}
+                        <div class="muted">{{ cert.installer_ca_note }}</div>
                         {% endif %}
                     </div>
                     <div class="ev ev-uncovered">
@@ -3538,26 +3432,88 @@ HTML_TEMPLATE = '''
         </tbody>
     </table>
 
+    {% if workboard and workboard.hpstrat99 %}
+    <details class="glossary">
+        <summary>What each Feature measures</summary>
+        <div class="glossary-body">
+            <p class="muted">
+                Outcome:
+                <a href="{{ workboard.hpstrat99.outcome.url }}" target="_blank" rel="noopener noreferrer">{{ workboard.hpstrat99.outcome.key }}</a>
+                {{ workboard.hpstrat99.outcome.title }}.
+                Open the Jira key for status and priority. Click a row to apply the same filter as the cards above.
+            </p>
+            <table class="cert-table" id="hpstrat99-table">
+                <thead>
+                    <tr>
+                        <th>Feature</th>
+                        <th>On this cluster</th>
+                        <th>What we measure</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {% for feat in workboard.hpstrat99.features %}
+                    <tr {% if feat.filter %}class="filter-jump" data-filter="{{ feat.filter }}" onclick="applyFilter('{{ feat.filter }}')"{% endif %}>
+                        <td>
+                            <a href="{{ feat.url }}" target="_blank" rel="noopener noreferrer" onclick="event.stopPropagation()"><code>{{ feat.key }}</code></a>
+                            {% if feat.also_key %}
+                            · <a href="{{ feat.also_url }}" target="_blank" rel="noopener noreferrer" onclick="event.stopPropagation()"><code>{{ feat.also_key }}</code></a>
+                            {% endif %}
+                            <div>{{ feat.title }}</div>
+                        </td>
+                        <td>
+                            {% if not feat.observable %}
+                            <span class="pill status-user">not in API PEMs</span>
+                            {% elif feat.count == 0 %}
+                            <span class="pill status-good">0</span>
+                            {% else %}
+                            <span class="pill status-critical">{{ feat.count }}</span>
+                            {% endif %}
+                        </td>
+                        <td class="owner-cell">{{ feat.gap }}</td>
+                    </tr>
+                    {% endfor %}
+                </tbody>
+            </table>
+        </div>
+    </details>
+    {% endif %}
+
     <div class="refresh-info">
         Page auto-refreshes every 5 minutes | Last updated: {{ generated_time }} |
         Rotate-at uses <code>certificates.openshift.io/refresh-period</code> when present, otherwise library-go 80% of validity.
     </div>
 <script>
+var currentFilter = 'all';
+function chipActive(chipFilter, name) {
+  if (chipFilter === name) return true;
+  if (chipFilter === 'ocpstrat-1826' && name.indexOf('ocpstrat-1826') === 0) return true;
+  if (chipFilter === 'uncovered' && name.indexOf('uncovered') === 0) return true;
+  return false;
+}
 function applyFilter(name) {
+  currentFilter = name;
   var rows = document.querySelectorAll('#cert-body tr');
   var visible = 0;
   for (var i = 0; i < rows.length; i++) {
     var row = rows[i];
     var show = true;
+    var reason = row.getAttribute('data-1826-reason') || '';
     if (name === 'uncovered') show = row.getAttribute('data-registry') === 'uncovered';
+    else if (name === 'uncovered-new') show = row.getAttribute('data-registry') === 'uncovered' && row.getAttribute('data-known') !== '1';
+    else if (name === 'uncovered-known') show = row.getAttribute('data-registry') === 'uncovered' && row.getAttribute('data-known') === '1';
     else if (name === 'signer') show = row.getAttribute('data-role') === 'signer';
     else if (name === 'leaf') show = row.getAttribute('data-role') === 'leaf';
     else if (name === 'external') show = row.getAttribute('data-origin') === 'external';
     else if (name === 'ocpstrat-1826') show = row.getAttribute('data-1826') === '1';
+    else if (name === 'ocpstrat-1826-forever') show = reason === 'ocpstrat-1826';
+    else if (name === 'ocpstrat-1826-installer') show = reason === 'installer-10y' || reason === 'installer-10y-keyless';
+    else if (name === 'ocpstrat-1826-hypershift') show = reason === 'hypershift-10y';
+    else if (name === 'ocpstrat-1826-namespace') show = row.getAttribute('data-scr-skip') === 'namespace';
     else if (name === 'ocpstrat-2272') show = row.getAttribute('data-2272') === '1';
     else if (name === 'ocpstrat-2273') show = row.getAttribute('data-2273') === '1';
     else if (name === 'ocpstrat-2271') show = row.getAttribute('data-keypolicy') === 'below-4096-ca';
     else if (name === 'ocpstrat-1990') show = row.getAttribute('data-pastrotate') === '1';
+    else if (name === 'ocpstrat-2029' || name === 'ocpstrat-1346') show = false;
     else if (name === 'usermanaged') show = row.getAttribute('data-usermanaged') === '1';
     row.style.display = show ? '' : 'none';
     var num = row.querySelector('.row-num');
@@ -3570,42 +3526,63 @@ function applyFilter(name) {
   }
   var label = document.getElementById('visible-count');
   if (label) label.textContent = '(' + visible + ' shown)';
-  var chips = document.querySelectorAll('.summary-card');
+  var chips = document.querySelectorAll('.summary-card, .filters button[data-filter]');
   for (var j = 0; j < chips.length; j++) {
-    if (chips[j].getAttribute('data-filter') === name) chips[j].classList.add('active');
+    var cf = chips[j].getAttribute('data-filter');
+    var on = (chips[j].tagName === 'BUTTON') ? (cf === name) : chipActive(cf, name);
+    if (on) chips[j].classList.add('active');
     else chips[j].classList.remove('active');
   }
   var hp = document.querySelectorAll('#hpstrat99-table tr.filter-jump');
   for (var h = 0; h < hp.length; h++) {
-    if (hp[h].getAttribute('data-filter') === name) hp[h].classList.add('active');
+    var hf = hp[h].getAttribute('data-filter') || '';
+    if (chipActive(hf, name)) hp[h].classList.add('active');
     else hp[h].classList.remove('active');
   }
   var panel = document.getElementById('uncovered-panel');
-  if (panel) panel.style.display = (name === 'uncovered') ? '' : 'none';
-  var scrp = document.getElementById('scr-panel');
-  if (scrp) scrp.style.display = (name === 'ocpstrat-1826') ? '' : 'none';
+  if (panel) panel.style.display = (name.indexOf('uncovered') === 0) ? '' : 'none';
+  var nrot = document.getElementById('norotate-panel');
+  if (nrot) nrot.style.display = (name.indexOf('ocpstrat-1826') === 0 && name !== 'ocpstrat-1826-namespace') ? '' : 'none';
+  var sub1826 = document.getElementById('1826-subfilters');
+  if (sub1826) sub1826.style.display = (name.indexOf('ocpstrat-1826') === 0) ? '' : 'none';
+  var sub2655 = document.getElementById('2655-subfilters');
+  if (sub2655) sub2655.style.display = (name.indexOf('uncovered') === 0) ? '' : 'none';
   var notes = document.querySelectorAll('[data-filter-note]');
   for (var n = 0; n < notes.length; n++) {
     notes[n].style.display = (notes[n].getAttribute('data-filter-note') === name) ? '' : 'none';
   }
   var headings = {
     all: 'Certificates',
-    uncovered: 'Missing owners',
+    uncovered: 'OCPSTRAT-2655 — missing owners',
+    'uncovered-new': 'OCPSTRAT-2655 — new missing owners',
+    'uncovered-known': 'OCPSTRAT-2655 — grandfathered missing owners',
     signer: 'Signers',
     leaf: 'Leaves',
     external: 'External issuers (not OCPSTRAT-2029)',
-    'ocpstrat-1826': 'OCPSTRAT-1826 — ShortCertRotation test ignores',
+    'ocpstrat-1826': 'OCPSTRAT-1826 — 10y will not auto-rotate',
+    'ocpstrat-1826-forever': 'OCPSTRAT-1826 — foreverPeriod',
+    'ocpstrat-1826-installer': 'OCPSTRAT-1826 — installer leftover CAs',
+    'ocpstrat-1826-hypershift': 'OCPSTRAT-1826 — HyperShift 10y CAs',
+    'ocpstrat-1826-namespace': 'OCPSTRAT-1826 — SCR not honored (namespace)',
     'ocpstrat-2272': 'OCPSTRAT-2272 — validity over 5y',
     'ocpstrat-2273': 'OCPSTRAT-2273 — validity 2–5y',
-    'ocpstrat-2271': 'OCPSTRAT-2271 — RSA CA below 4096',
+    'ocpstrat-2271': 'OCPSTRAT-2271 / 3050 — RSA CA below 4096',
     'ocpstrat-1990': 'OCPSTRAT-1990 — past rotate-at',
+    'ocpstrat-2029': 'OCPSTRAT-2029 — not visible as PEMs',
+    'ocpstrat-1346': 'OCPSTRAT-1346 — not visible as PEMs',
     usermanaged: 'User-managed — action needed'
   };
   var heading = document.getElementById('cert-heading-label');
   if (heading) heading.textContent = headings[name] || 'Certificates';
   var evidenceHead = {
-    'ocpstrat-1826': 'Why the SCR test skips',
+    'ocpstrat-1826': 'Why it will not rotate',
+    'ocpstrat-1826-forever': 'Why it will not rotate',
+    'ocpstrat-1826-installer': 'Why it will not rotate',
+    'ocpstrat-1826-hypershift': 'Why it will not rotate',
+    'ocpstrat-1826-namespace': 'Why SCR is not honored',
     uncovered: 'New vs grandfathered',
+    'uncovered-new': 'New vs grandfathered',
+    'uncovered-known': 'New vs grandfathered',
     external: 'Issuer DN',
     'ocpstrat-2271': 'Key size',
     'ocpstrat-1990': 'Rotate-at',
