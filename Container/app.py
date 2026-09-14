@@ -453,6 +453,91 @@ OCPSTRAT_1826_EXPECTED = (
 )
 FOREVER_PERIOD_SIGNERS = OCPSTRAT_1826_NO_ROTATE - {'localhost-recovery-serving-certkey'}
 FOREVER_PERIOD_LEAFS = frozenset({'localhost-recovery-serving-certkey'})
+# Static-pod revisions of the recovery leaf (localhost-recovery-serving-certkey-2, …).
+FOREVER_PERIOD_CERTKEY_RE = re.compile(r'^localhost-recovery-serving-certkey(?:-\d+)?$')
+
+
+def is_forever_period_leaf_name(name):
+    if not name:
+        return False
+    if name in FOREVER_PERIOD_LEAFS:
+        return True
+    return bool(FOREVER_PERIOD_CERTKEY_RE.match(name))
+
+
+def is_forever_period_name(name):
+    """kube-apiserver-operator Validity: foreverPeriod artifacts (OCPSTRAT-1826)."""
+    if not name:
+        return False
+    if name in FOREVER_PERIOD_SIGNERS:
+        return True
+    return is_forever_period_leaf_name(name)
+
+
+# Secrets ShortCertRotation does not shorten (payload test leftovers).
+# foreverPeriod is classified separately via is_forever_period_name.
+# 10y: ValidityDuration == "10y" skip. Namespace: operators that never wired the gate.
+SCR_UNSHORTENED_10Y_SECRETS = frozenset({
+    ('openshift-machine-config-operator', 'machine-config-server-ca'),
+    ('openshift-machine-config-operator', 'machine-config-server-tls'),
+    ('openshift-ovn-kubernetes', 'ovn-ca'),
+    ('openshift-ovn-kubernetes', 'signer-ca'),
+    ('openshift-network-node-identity', 'network-node-identity-ca'),
+})
+SCR_UNSHORTENED_NAMESPACE_SECRETS = frozenset({
+    ('openshift-ingress-operator', 'router-ca'),
+    ('openshift-ingress', 'router-certs-default'),
+    ('openshift-operator-lifecycle-manager', 'packageserver-service-cert'),
+})
+# Live-check rows for "which certs are NOT shortened by ShortCertRotation?"
+SCR_UNSHORTENED_EXPECTED = (
+    ('openshift-kube-apiserver-operator', 'localhost-serving-signer', 'foreverPeriod'),
+    ('openshift-kube-apiserver-operator', 'service-network-serving-signer', 'foreverPeriod'),
+    ('openshift-kube-apiserver-operator', 'loadbalancer-serving-signer', 'foreverPeriod'),
+    ('openshift-kube-apiserver-operator', 'localhost-recovery-serving-signer', 'foreverPeriod'),
+    ('openshift-kube-apiserver', 'localhost-recovery-serving-certkey', 'foreverPeriod'),
+    ('openshift-machine-config-operator', 'machine-config-server-ca', '10y'),
+    ('openshift-machine-config-operator', 'machine-config-server-tls', '10y'),
+    ('openshift-ovn-kubernetes', 'ovn-ca', '10y'),
+    ('openshift-ovn-kubernetes', 'signer-ca', '10y'),
+    ('openshift-network-node-identity', 'network-node-identity-ca', '10y'),
+    ('openshift-ingress-operator', 'router-ca', 'namespace'),
+    ('openshift-ingress', 'router-certs-default', 'namespace'),
+    ('openshift-operator-lifecycle-manager', 'packageserver-service-cert', 'namespace'),
+)
+SCR_SKIP_LABELS = {
+    'foreverPeriod': (
+        'foreverPeriod — ShortCertRotation does not shorten 10y (OCPSTRAT-1826)'
+    ),
+    '10y': (
+        '10y ValidityDuration — ShortCertRotation does not shorten this '
+        '(payload test skip). OVN/NNI CAs still refresh at 9y; MCS at 8y.'
+    ),
+    'namespace': (
+        'Owning operator does not use ShortCertRotation '
+        '(ingress / OLM; payload-test ignored namespace).'
+    ),
+}
+
+
+def classify_short_cert_rotation_skip(name, namespace, resource_type, validity_days,
+                                      injected_ca_copy=False):
+    """Which payload-test skip (if any) leaves this secret long when SCR is on."""
+    if injected_ca_copy:
+        return ''
+    if is_forever_period_name(name):
+        return 'foreverPeriod' if is_ten_year_lifetime(validity_days) else ''
+    if resource_type != 'secret':
+        return ''
+    key = (namespace, name)
+    if key in SCR_UNSHORTENED_10Y_SECRETS:
+        return '10y' if is_ten_year_lifetime(validity_days) else ''
+    if key in SCR_UNSHORTENED_NAMESPACE_SECRETS:
+        # Typical 2y. Hour-scale lifetime means the operator started honoring the gate.
+        return 'namespace' if (validity_days or 0) >= 7 else ''
+    return ''
+
+
 INJECTED_CA_BUNDLE_NAMES = frozenset({
     'kube-root-ca.crt',
     'openshift-service-ca.crt',
@@ -731,7 +816,7 @@ def determine_cert_role(resource_type, name, data_fields, annotations, labels, p
     fields = {f.strip() for f in (data_fields or '').split(',') if f.strip()}
     if managed_type == 'signer' or name in FOREVER_PERIOD_SIGNERS:
         return 'signer'
-    if managed_type == 'target' or name in FOREVER_PERIOD_LEAFS:
+    if managed_type == 'target' or is_forever_period_leaf_name(name):
         return 'leaf'
     if name in INJECTED_CA_BUNDLE_NAMES:
         return 'ca-bundle'
@@ -959,6 +1044,18 @@ def determine_issuer_origin(issuer, ca_category):
     return 'external'
 
 
+def unique_issuer_dns(pem_certs, fallback=''):
+    """Distinct issuer DNs from every PEM in the object (order preserved)."""
+    seen = []
+    for parsed in pem_certs or []:
+        issuer = (parsed.get('issuer') or '').strip()
+        if issuer and issuer not in seen:
+            seen.append(issuer)
+    if not seen and (fallback or '').strip():
+        seen.append(fallback.strip())
+    return seen
+
+
 def classify_no_auto_rotate(name, cert_role, validity_days, injected_ca_copy,
                             resource_type='secret', has_private_key=False,
                             pem_certs=None):
@@ -984,7 +1081,7 @@ def classify_no_auto_rotate(name, cert_role, validity_days, injected_ca_copy,
         days = validity_days
     if not is_ten_year_lifetime(days):
         return False, ''
-    if name in OCPSTRAT_1826_NO_ROTATE:
+    if is_forever_period_name(name):
         return True, 'ocpstrat-1826'
     if name in INSTALLER_NO_ROTATE:
         return True, 'installer-10y'
@@ -1299,6 +1396,9 @@ def process_resource_obj(resource_type, obj, cert_data, has_private_key, cert_fi
             installer_keyless_lifecycle(name, subject_cn(parsed.get('subject')))
             if no_rotate_reason == 'installer-10y-keyless' else ''
         )
+        scr_skip_kind = classify_short_cert_rotation_skip(
+            name, namespace, resource_type, validity_days, injected_ca_copy
+        )
         managed_status, managed_details = determine_managed_status(
             resource_type, name, namespace, cert_data, issuer, validity_days,
             annotations, labels, will_not_rotate
@@ -1381,6 +1481,7 @@ def process_resource_obj(resource_type, obj, cert_data, has_private_key, cert_fi
             'ca_category': ca_category,
             'relevant_annotations': '\n'.join(relevant_annos) if relevant_annos else '',
             'issuer': issuer,
+            'issuers': unique_issuer_dns(pem_certs, issuer),
             'subject': parsed['subject'],
             'cert_role': cert_role,
             'is_ca': parsed['is_ca'],
@@ -1392,7 +1493,12 @@ def process_resource_obj(resource_type, obj, cert_data, has_private_key, cert_fi
             'installer_ca_lifecycle': installer_lifecycle,
             'installer_ca_note': INSTALLER_KEYLESS_NOTES.get(installer_lifecycle, ''),
             'is_forever_period_signer': name in FOREVER_PERIOD_SIGNERS,
-            'is_ocpstrat_1826': name in OCPSTRAT_1826_NO_ROTATE,
+            'is_forever_period_leaf': is_forever_period_leaf_name(name),
+            'is_forever_period': is_forever_period_name(name) and will_not_rotate,
+            'is_ocpstrat_1826': is_forever_period_name(name) and will_not_rotate,
+            'scr_skip_kind': scr_skip_kind,
+            'scr_skip_label': SCR_SKIP_LABELS.get(scr_skip_kind, ''),
+            'not_shortened_by_scr': bool(scr_skip_kind),
             'injected_ca_copy': injected_ca_copy,
             'key_type': parsed['key_type'],
             'key_size': parsed['key_size'],
@@ -1558,6 +1664,8 @@ def summarize_certificates(certificates):
         'ten_year': sum(1 for c in certificates if c.get('will_not_auto_rotate')),
         'will_not_auto_rotate': sum(1 for c in certificates if c.get('will_not_auto_rotate')),
         'forever_period_signers': sum(1 for c in certificates if c.get('is_forever_period_signer')),
+        'forever_period': sum(1 for c in certificates if c.get('is_forever_period')),
+        'not_shortened_by_scr': sum(1 for c in certificates if c.get('not_shortened_by_scr')),
         'ocpstrat_1826': sum(1 for c in certificates if c.get('is_ocpstrat_1826')),
         'below_4096_ca': sum(1 for c in certificates if c.get('key_policy') == 'below-4096-ca'),
         'past_rotate_at': sum(
@@ -1589,9 +1697,13 @@ def ocpstrat_1826_inventory(certificates):
     """The five OCPSTRAT-1826 named secrets vs what this API actually has."""
     rows = []
     for name in OCPSTRAT_1826_EXPECTED:
-        hits = [c for c in certificates if c.get('name') == name]
+        if name == 'localhost-recovery-serving-certkey':
+            hits = [c for c in certificates if is_forever_period_leaf_name(c.get('name'))]
+        else:
+            hits = [c for c in certificates if c.get('name') == name]
         primary = next((c for c in hits if c.get('has_private_key')), hits[0] if hits else None)
         owners = sorted({c.get('owning_component') for c in hits if c.get('owning_component')})
+        revision_names = sorted({c.get('name') for c in hits if c.get('name')})
         rows.append({
             'name': name,
             'found': bool(hits),
@@ -1603,6 +1715,49 @@ def ocpstrat_1826_inventory(certificates):
             'private_key': any(c.get('has_private_key') for c in hits),
             'owning_component': ', '.join(owners),
             'owning_description': (primary or {}).get('owning_description') or '',
+            'revision_count': len(hits),
+            'revision_names': revision_names,
+        })
+    return rows
+
+
+def short_cert_rotation_inventory(certificates):
+    """Named secrets ShortCertRotation does not shorten vs what this API has."""
+    rows = []
+    for namespace, name, kind in SCR_UNSHORTENED_EXPECTED:
+        if name == 'localhost-recovery-serving-certkey':
+            hits = [
+                c for c in certificates
+                if is_forever_period_leaf_name(c.get('name'))
+                and c.get('resource_type') == 'secret'
+            ]
+        else:
+            hits = [
+                c for c in certificates
+                if c.get('namespace') == namespace
+                and c.get('name') == name
+                and c.get('resource_type') == 'secret'
+            ]
+        primary = next((c for c in hits if c.get('has_private_key')), hits[0] if hits else None)
+        owners = sorted({c.get('owning_component') for c in hits if c.get('owning_component')})
+        revision_names = sorted({c.get('name') for c in hits if c.get('name')})
+        rows.append({
+            'namespace': namespace,
+            'name': name,
+            'skip_kind': kind,
+            'skip_label': SCR_SKIP_LABELS.get(kind, ''),
+            'found': bool(hits),
+            'on_this_api': bool(hits),
+            'namespaces': sorted({c.get('namespace') for c in hits if c.get('namespace')}),
+            'issued': (primary or {}).get('issued') or '',
+            'validity_label': (primary or {}).get('validity_label') or '',
+            'has_private_key': any(c.get('has_private_key') for c in hits),
+            'private_key': any(c.get('has_private_key') for c in hits),
+            'owning_component': ', '.join(owners),
+            'owning_description': (primary or {}).get('owning_description') or '',
+            'revision_count': len(hits),
+            'revision_names': revision_names,
+            'in_1826_scope': kind == 'foreverPeriod',
         })
     return rows
 
@@ -1808,6 +1963,7 @@ def _work_item(cert, category, why, status=''):
         'rotate_at': cert.get('rotate_at') or '',
         'rotate_at_source': cert.get('rotate_at_source') or '',
         'days_until_rotate': cert.get('days_until_rotate'),
+        'is_forever_period': bool(cert.get('is_forever_period')),
         'installer_ca_lifecycle': lifecycle,
         'installer_ca_note': cert.get('installer_ca_note') or '',
     }
@@ -1859,7 +2015,7 @@ def hpstrat99_tracker(certificates, counts):
                 'title': 'Manual rotation of 10-year certificates',
                 'count': counts.get('will-not-rotate') or 0,
                 'observable': True,
-                'gap': 'Signer secrets with a private key that will not auto-rotate (foreverPeriod, installer, HyperShift 10y).',
+                'gap': 'foreverPeriod kube-apiserver secrets ShortCertRotation does not shorten, plus installer / HyperShift 10y signers. MCS/OVN/NNI 10y CAs and ingress/OLM certs are also not shortened — see the Not shortened filter; they are not this Feature.',
             },
             {
                 'key': 'OCPSTRAT-2272',
@@ -2098,7 +2254,13 @@ def compact_cert(cert):
         'will_not_auto_rotate': cert.get('will_not_auto_rotate'),
         'no_rotate_reason': cert.get('no_rotate_reason'),
         'no_rotate_label': cert.get('no_rotate_label') or '',
+        'is_forever_period': bool(cert.get('is_forever_period')),
+        'is_ocpstrat_1826': bool(cert.get('is_ocpstrat_1826')),
+        'scr_skip_kind': cert.get('scr_skip_kind') or '',
+        'scr_skip_label': cert.get('scr_skip_label') or '',
+        'not_shortened_by_scr': bool(cert.get('not_shortened_by_scr')),
         'issuer': cert.get('issuer'),
+        'issuers': cert.get('issuers') or ([cert.get('issuer')] if cert.get('issuer') else []),
         'private_key': bool(cert.get('has_private_key')),
         'has_private_key': bool(cert.get('has_private_key')),
         'missing_owner': cert.get('tls_registry_status') == 'uncovered',
@@ -2130,6 +2292,7 @@ def index():
             if c.get('will_not_auto_rotate')
         ]
         ocpstrat_1826 = ocpstrat_1826_inventory(certificates)
+        scr_unshortened = short_cert_rotation_inventory(certificates)
         origin_expected, origin_new = origin_ownership_inventory(certificates)
         uncovered_certificates = [c for c in uncovered if c.get('origin_kind') == 'certificate']
         uncovered_ca_bundles = [c for c in uncovered if c.get('origin_kind') == 'ca-bundle']
@@ -2147,6 +2310,7 @@ def index():
             uncovered=uncovered,
             no_rotate=no_rotate,
             ocpstrat_1826=ocpstrat_1826,
+            scr_unshortened=scr_unshortened,
             origin_expected=origin_expected,
             origin_new=origin_new,
             uncovered_certificates=uncovered_certificates,
@@ -2207,10 +2371,13 @@ def api_certificates():
             'summary': summary,
             'workboard': workboard,
             'ocpstrat_1826': ocpstrat_1826_inventory(certificates),
+            'short_cert_rotation_unshortened': short_cert_rotation_inventory(certificates),
             'unique_non_rotating_cas': unique_cas,
             'missing_owners': uncovered,
             'uncovered': uncovered,
             'will_not_auto_rotate': no_rotate,
+            'forever_period': [compact_cert(c) for c in certificates if c.get('is_forever_period')],
+            'not_shortened_by_scr': [compact_cert(c) for c in certificates if c.get('not_shortened_by_scr')],
             'compact': compact_rows,
             'collapsed_injected_copies': collapsed_injected,
             'certificates': certificates,
@@ -2591,6 +2758,9 @@ HTML_TEMPLATE = '''
         a { color: #007BFF; text-decoration: none; }
         a:hover { text-decoration: underline; }
         .owner-cell { max-width: 280px; word-wrap: break-word; }
+        .issuer-cell { max-width: 36em; word-break: break-word; }
+        .issuer-cell code { font-size: 0.85em; display: block; }
+        #inventory-table.view-external .hide-on-external { display: none; }
         .registry-owner {
             margin: 8px 0;
             border: 1px solid #E0E0E0;
@@ -2625,7 +2795,7 @@ HTML_TEMPLATE = '''
             &nbsp;|&nbsp; <a href="/api/uncovered">Missing-owner API</a>
         </div>
         <details class="glossary">
-            <summary>Glossary — TLS registry, signer, CA, PEM, leaf, rotation, foreverPeriod, owning component</summary>
+            <summary>Glossary — TLS registry, signer, CA, PEM, leaf, rotation, foreverPeriod, ShortCertRotation, owning component</summary>
             <div class="glossary-body">
                 <p class="muted">Collapsed until you need it. Same words appear as filters and column values.</p>
                 <dl>
@@ -2708,10 +2878,22 @@ HTML_TEMPLATE = '''
                         <code>service-network-serving-signer</code>,
                         <code>loadbalancer-serving-signer</code>,
                         <code>localhost-recovery-serving-signer</code>,
-                        and <code>localhost-recovery-serving-certkey</code>.
+                        and <code>localhost-recovery-serving-certkey</code>
+                        (plus static-pod revisions <code>localhost-recovery-serving-certkey-2</code> …).
                         Installer and HyperShift 10-year CAs are the same gap by lifetime, but they
-                        are not this operator variable.
-                        <span class="use">Used for: naming the five kube-apiserver artifacts that will not auto-rotate, and explaining why their Validity is 10y.</span></dd>
+                        are not this operator variable. CNO OperatorPKI, MCS, and network-node-identity
+                        10y certs are not <code>foreverPeriod</code>.
+                        <span class="use">Used for: naming the kube-apiserver artifacts that will not auto-rotate, and explaining why their Validity is 10y.</span></dd>
+                    <dt>ShortCertRotation</dt>
+                    <dd>An install-time feature gate that shortens most library-go cert lifetimes to hours
+                        (so payload tests can observe rotation). It does <em>not</em> rewrite
+                        kube-apiserver <code>foreverPeriod</code> (10y). The payload test then skips any
+                        remaining <code>ValidityDuration == "10y"</code> certs, and separately ignores
+                        ingress and OLM namespaces whose operators never wired the gate.
+                        <a href="https://issues.redhat.com/browse/OCPSTRAT-1826" target="_blank" rel="noopener noreferrer">OCPSTRAT-1826</a>
+                        Goal 3 is to stop skipping foreverPeriod. MCS, OVN/NNI 10y CAs, and
+                        ingress/OLM 2y certs are also not shortened, but they are not that Feature.
+                        <span class="use">Used for: the Not shortened filter — live answer to “which certs are NOT shortened by ShortCertRotation?”</span></dd>
                     <dt>Owning component</dt>
                     <dd>The Jira component in <code>openshift.io/owning-component</code>. The OpenShift TLS registry requires this on every collected artifact so cert bugs route to a team.
                         <span class="use">Used for: assigning ownership. Empty means Missing Owner — OpenShift CI blocks new ones; five grandfathered ingress/kube-system gaps remain.</span></dd>
@@ -2869,6 +3051,9 @@ HTML_TEMPLATE = '''
                             {% endif %}
                             <td>{{ item.namespace }}</td>
                             <td><code>{{ item.name }}</code>
+                                {% if item.is_forever_period %}
+                                <div><span class="pill status-critical" title="kube-apiserver operator Validity: foreverPeriod (10y, refresh 8y). ShortCertRotation skips 10y. OCPSTRAT-1826.">foreverPeriod</span></div>
+                                {% endif %}
                                 {% if item.copy_count and item.copy_count > 1 %}
                                 <div class="muted">{{ item.copy_count }} copies of this certificate</div>
                                 {% endif %}
@@ -2939,6 +3124,14 @@ HTML_TEMPLATE = '''
             <h3>Will not rotate</h3>
             <div class="summary-count" style="color: #721C24;">{{ summary.will_not_auto_rotate }}</div>
         </div>
+        <div class="summary-card" data-filter="foreverperiod" onclick="applyFilter('foreverperiod')">
+            <h3>foreverPeriod</h3>
+            <div class="summary-count" style="color: #721C24;">{{ summary.forever_period }}</div>
+        </div>
+        <div class="summary-card" data-filter="notshortened" onclick="applyFilter('notshortened')">
+            <h3>Not shortened</h3>
+            <div class="summary-count" style="color: #721C24;">{{ summary.not_shortened_by_scr }}</div>
+        </div>
         <div class="summary-card" data-filter="keypolicy" onclick="applyFilter('keypolicy')">
             <h3>RSA CA needs 4096</h3>
             <div class="summary-count" style="color: #721C24;">{{ summary.below_4096_ca }}</div>
@@ -2960,6 +3153,8 @@ HTML_TEMPLATE = '''
         <button data-filter="leaf" onclick="applyFilter('leaf')">Leaves</button>
         <button data-filter="external" onclick="applyFilter('external')">External</button>
         <button data-filter="tenyear" onclick="applyFilter('tenyear')">Will not rotate</button>
+        <button data-filter="foreverperiod" onclick="applyFilter('foreverperiod')">foreverPeriod</button>
+        <button data-filter="notshortened" onclick="applyFilter('notshortened')">Not shortened</button>
         <button data-filter="keypolicy" onclick="applyFilter('keypolicy')">RSA CA needs 4096</button>
         <button data-filter="pastrotate" onclick="applyFilter('pastrotate')">Past rotate-at</button>
         <button data-filter="usermanaged" onclick="applyFilter('usermanaged')">User-managed</button>
@@ -2972,6 +3167,7 @@ HTML_TEMPLATE = '''
             expire in production. Use the filters to inspect gaps against that goal:
             missing owning component, signers that will not auto-rotate
             (<a href="https://issues.redhat.com/browse/OCPSTRAT-1826" target="_blank" rel="noopener noreferrer">OCPSTRAT-1826</a>),
+            certs <strong>ShortCertRotation does not shorten</strong>,
             RSA root CAs still at 2048 bits, issuers outside platform PKI, and
             especially <strong>user-managed</strong> certs that an administrator must
             still rotate. <strong>Issued</strong> and <strong>Validity</strong> are the
@@ -3011,7 +3207,7 @@ HTML_TEMPLATE = '''
             <code>foreverPeriod</code> serving signers do not auto-rotate today, and there is no supported
             manual rotation yet
             (<a href="https://issues.redhat.com/browse/OCPSTRAT-1826" target="_blank" rel="noopener noreferrer">OCPSTRAT-1826</a>).
-            Open the <strong>Will not rotate</strong> filter for those named secrets.
+            Open the <strong>foreverPeriod</strong> filter for those named secrets.
             Issued and Validity are the certificate lifetime (<code>notAfter − notBefore</code>),
             not days remaining.
         </div>
@@ -3021,7 +3217,8 @@ HTML_TEMPLATE = '''
             is rotated on <em>its own</em> validity (80% / refresh annotation), not
             “when the CA rotates.” That includes 30-day serving certkeys whose CA
             is a 10-year foreverPeriod signer. Exceptions that do not auto-rotate:
-            <code>localhost-recovery-serving-certkey</code>
+            <code>localhost-recovery-serving-certkey</code> and its static-pod revisions
+            <code>-2</code> …
             (<a href="https://issues.redhat.com/browse/OCPSTRAT-1826" target="_blank" rel="noopener noreferrer">OCPSTRAT-1826</a>),
             and user-managed leaves (rotate them, or move them onto Service-CA / an operator).
         </div>
@@ -3029,6 +3226,7 @@ HTML_TEMPLATE = '''
             These certificates have an issuer DN this console does not classify as
             OpenShift internal PKI (no platform markers). Typical cases: operator-local
             CAs, a proxy <code>trusted-ca-bundle</code>, custom ingress, or an enterprise chain.
+            The <strong>Issuer</strong> column is that DN (every unique issuer in a bundle).
             Confirm each row is expected and who rotates it.
             This filter is not
             <a href="https://issues.redhat.com/browse/OCPSTRAT-2029" target="_blank" rel="noopener noreferrer">OCPSTRAT-2029</a>
@@ -3047,6 +3245,42 @@ HTML_TEMPLATE = '''
             with private keys.
             On a hosted guest the five kube-apiserver foreverPeriod secrets usually live
             on the management cluster — the checklist below is the live presence check.
+        </div>
+        <div class="warn-box filter-note" data-filter-note="foreverperiod" style="display: none;">
+            kube-apiserver-operator artifacts whose validity is
+            <code>foreverPeriod</code> (10 × 365 × 24h, refresh at 8 years).
+            <a href="https://issues.redhat.com/browse/OCPSTRAT-1826" target="_blank" rel="noopener noreferrer">OCPSTRAT-1826</a>
+            Goal 3 is to stop skipping these when ShortCertRotation is on
+            (the payload test skips <code>ValidityDuration == "10y"</code>).
+            The four serving signers plus the recovery leaf
+            (<code>localhost-recovery-serving-certkey</code>, including static-pod
+            revisions <code>-2</code> …) are listed. Installer leftover CAs and
+            HyperShift 10-year CAs are in <strong>Will not rotate</strong>, not here.
+            CNO OperatorPKI (<code>ovn-ca</code>), MCS, and network-node-identity 10y
+            certs are not this operator variable and still rotate or are out of 1826.
+            On a hosted guest these secrets usually live on the management cluster.
+        </div>
+        <div class="warn-box filter-note" data-filter-note="notshortened" style="display: none;">
+            Live answer to <strong>which certs are NOT shortened by ShortCertRotation?</strong>
+            Two independent payload-test skips, plus the kube-apiserver operator variable
+            the test is nicknaming “forever”:
+            <ul>
+                <li><code>ValidityDuration == "10y"</code> — CKAO
+                    <code>foreverPeriod</code> (four serving signers + recovery leaf, including
+                    static-pod revisions), MCS CA and TLS, OVN/NNI OperatorPKI CAs
+                    (<code>ovn-ca</code>, <code>signer-ca</code>,
+                    <code>network-node-identity-ca</code>). OVN/NNI leaves
+                    (<code>*-cert</code>) <em>are</em> shortened when the gate is on and are
+                    not listed. OVN/NNI CAs still refresh at 9y; MCS at 8y.</li>
+                <li>Ignored namespaces — ingress and OLM never wired the gate:
+                    <code>router-ca</code>, <code>router-certs-default</code>,
+                    <code>packageserver-service-cert</code> (about 2y, not 10y).</li>
+            </ul>
+            <a href="https://issues.redhat.com/browse/OCPSTRAT-1826" target="_blank" rel="noopener noreferrer">OCPSTRAT-1826</a>
+            is only the foreverPeriod subset (Goal 3: stop skipping those 10y kube-apiserver
+            artifacts). Installer leftover CAs are also 10y; they are under
+            <strong>Will not rotate</strong>, not this operator-wiring list.
+            The checklist below is presence of those named secrets on this API.
         </div>
         <div class="warn-box filter-note" data-filter-note="keypolicy" style="display: none;">
             <a href="https://issues.redhat.com/browse/OCPSTRAT-2271" target="_blank" rel="noopener noreferrer">OCPSTRAT-2271</a>
@@ -3105,7 +3339,12 @@ HTML_TEMPLATE = '''
                 {% for row in ocpstrat_1826 %}
                 <tr>
                     <td class="row-num">{{ loop.index }}</td>
-                    <td><code>{{ row.name }}</code></td>
+                    <td><code>{{ row.name }}</code>
+                        <div><span class="pill status-critical" title="kube-apiserver operator Validity: foreverPeriod. ShortCertRotation skips 10y.">foreverPeriod</span></div>
+                        {% if row.revision_count and row.revision_count > 1 %}
+                        <div class="muted">{{ row.revision_count }} objects on this API (includes static-pod revisions)</div>
+                        {% endif %}
+                    </td>
                     <td>{% if row.namespaces %}{{ row.namespaces | join(', ') }}{% else %}—{% endif %}</td>
                     <td>
                         {% if row.found %}
@@ -3121,6 +3360,70 @@ HTML_TEMPLATE = '''
                     <td>{{ row.issued or '—' }}</td>
                     <td>{{ row.validity_label or '—' }}</td>
                     <td>{{ 'yes' if row.has_private_key else ('no' if row.found else '—') }}</td>
+                </tr>
+                {% endfor %}
+            </tbody>
+        </table>
+    </div>
+
+    <div id="scr-panel" style="display: none;">
+        <div class="section-title">Not shortened by ShortCertRotation (live check)</div>
+        <p class="muted">Named secrets the ShortCertRotation feature gate does not shorten.
+            <strong>foreverPeriod</strong> is
+            <a href="https://issues.redhat.com/browse/OCPSTRAT-1826" target="_blank" rel="noopener noreferrer">OCPSTRAT-1826</a>
+            (kube-apiserver 10y). <strong>10y</strong> is the same payload-test
+            <code>ValidityDuration == "10y"</code> skip for MCS / OVN / NNI CAs (those CAs
+            still auto-rotate at 8y or 9y). <strong>namespace</strong> is ingress and OLM,
+            which never wired the gate (~2y certs). Recovery-leaf revisions count as one
+            artifact. Hosted guests normally lack the foreverPeriod secrets (they live on
+            the management cluster).</p>
+        <table class="cert-table" id="scr-unshortened-table">
+            <thead>
+                <tr>
+                    <th class="row-num">#</th>
+                    <th>Secret</th>
+                    <th>Namespace</th>
+                    <th>Why not shortened</th>
+                    <th class="has-tip" title="Whether this named secret exists in this cluster’s API. Color is inventory, not a failure.">On this API</th>
+                    <th>Owning component</th>
+                    <th>Issued</th>
+                    <th>Validity</th>
+                    <th>Private key</th>
+                    <th>OCPSTRAT-1826</th>
+                </tr>
+            </thead>
+            <tbody>
+                {% for row in scr_unshortened %}
+                <tr>
+                    <td class="row-num">{{ loop.index }}</td>
+                    <td><code>{{ row.name }}</code>
+                        {% if row.skip_kind == 'foreverPeriod' %}
+                        <div><span class="pill status-critical">foreverPeriod</span></div>
+                        {% elif row.skip_kind == '10y' %}
+                        <div><span class="pill status-warning">10y skip</span></div>
+                        {% else %}
+                        <div><span class="pill status-user">namespace skip</span></div>
+                        {% endif %}
+                        {% if row.revision_count and row.revision_count > 1 %}
+                        <div class="muted">{{ row.revision_count }} objects on this API (includes static-pod revisions)</div>
+                        {% endif %}
+                    </td>
+                    <td>{{ row.namespace }}</td>
+                    <td class="owner-cell">{{ row.skip_label }}</td>
+                    <td>
+                        {% if row.found %}
+                        <span class="pill status-info">present</span>
+                        {% elif hosted_guest and row.skip_kind == 'foreverPeriod' %}
+                        <span class="pill status-user" title="Expected on a hosted guest. These kube-apiserver secrets live on the management cluster.">not on this API</span>
+                        {% else %}
+                        <span class="pill status-warning">not on this API</span>
+                        {% endif %}
+                    </td>
+                    <td class="owner-cell">{% if row.owning_component %}{{ row.owning_component }}{% else %}—{% endif %}</td>
+                    <td>{{ row.issued or '—' }}</td>
+                    <td>{{ row.validity_label or '—' }}</td>
+                    <td>{{ 'yes' if row.has_private_key else ('no' if row.found else '—') }}</td>
+                    <td>{% if row.in_1826_scope %}yes{% else %}no{% endif %}</td>
                 </tr>
                 {% endfor %}
             </tbody>
@@ -3185,7 +3488,7 @@ HTML_TEMPLATE = '''
         (same PEM as <code>kube-root-ca.crt</code> / service-ca) are collapsed here.
         Full dump: <a href="/api/certificates">/api/certificates</a>.</p>
     {% endif %}
-    <table class="cert-table">
+    <table class="cert-table" id="inventory-table">
         <thead>
             <tr>
                 <th class="row-num">#</th>
@@ -3193,15 +3496,15 @@ HTML_TEMPLATE = '''
                 <th>Namespace</th>
                 <th class="has-tip" title="Jira component in openshift.io/owning-component. Description is openshift.io/description. See glossary.">Owning component</th>
                 <th class="has-tip" title="Signer (CA + key), leaf (end-entity), or CA bundle (trust store). See glossary.">Role</th>
-                <th class="has-tip" title="Why this row matches the current gap: will-not-rotate class, or the four OpenShift TLS-collector checks for missing owners.">Why</th>
-                <th>Key type</th>
-                <th>Key size</th>
+                <th class="hide-on-external has-tip" title="Why this row matches the current gap: will-not-rotate class, or the four OpenShift TLS-collector checks for missing owners.">Why</th>
+                <th class="hide-on-external">Key type</th>
+                <th class="hide-on-external">Key size</th>
                 <th>Issued</th>
                 <th class="has-tip" title="Certificate lifetime (notAfter minus notBefore), not days remaining.">Validity</th>
                 <th class="has-tip" title="Days until notAfter. A recently issued 10-year CA still has ~9 years left.">Days left</th>
                 <th class="has-tip" title="When the operator is expected to refresh this cert (annotation or 80% of lifetime).">Rotate-at</th>
-                <th>Issuer origin</th>
-                <th class="has-tip" title="OpenShift TLS registry status. Missing owner: certificate vs CA bundle, and new (CI fails) vs grandfathered (ownership.md 5).">Registry</th>
+                <th class="has-tip" title="Issuer DN from the certificate. The pill is platform vs external (not classified as OpenShift internal PKI). Bundles list each unique issuer.">Issuer</th>
+                <th class="hide-on-external has-tip" title="OpenShift TLS registry status. Missing owner: certificate vs CA bundle, and new (CI fails) vs grandfathered (ownership.md 5).">Registry</th>
                 <th class="has-tip" title="Who rotates this artifact. 10-year CA means the cert itself lasts ~10 years and will not be regenerated.">Management</th>
             </tr>
         </thead>
@@ -3212,6 +3515,8 @@ HTML_TEMPLATE = '''
                 data-registry="{{ cert.tls_registry_status }}"
                 data-origin="{{ cert.issuer_origin }}"
                 data-tenyear="{{ '1' if cert.will_not_auto_rotate else '0' }}"
+                data-foreverperiod="{{ '1' if cert.is_forever_period else '0' }}"
+                data-notshortened="{{ '1' if cert.not_shortened_by_scr else '0' }}"
                 data-keypolicy="{{ cert.key_policy }}"
                 data-pastrotate="{{ '1' if cert.days_until_rotate is not none and cert.days_until_rotate < 0 and not cert.will_not_auto_rotate and cert.has_private_key and cert.cert_role != 'ca-bundle' else '0' }}"
                 data-usermanaged="{{ '1' if 'User-Managed' in cert.managed_status else '0' }}"
@@ -3221,8 +3526,15 @@ HTML_TEMPLATE = '''
                     {% if cert.copy_count and cert.copy_count > 1 %}
                     <div class="muted" title="{{ (cert.copy_namespaces or []) | join(', ') }}">×{{ cert.copy_count }} copies</div>
                     {% endif %}
-                    {% if cert.will_not_auto_rotate %}
+                    {% if cert.is_forever_period %}
+                    <div><span class="pill status-critical" title="kube-apiserver operator Validity: foreverPeriod (10y, refresh 8y). ShortCertRotation skips 10y. OCPSTRAT-1826.">foreverPeriod</span></div>
+                    {% elif cert.not_shortened_by_scr %}
+                    <div><span class="pill status-warning" title="{{ cert.scr_skip_label }}">not shortened</span></div>
+                    {% elif cert.will_not_auto_rotate %}
                     <div><span class="pill status-critical">will not auto-rotate</span></div>
+                    {% endif %}
+                    {% if cert.is_forever_period_leaf and cert.name != 'localhost-recovery-serving-certkey' %}
+                    <div class="muted">Static-pod revision of localhost-recovery-serving-certkey</div>
                     {% endif %}
                     {% if cert.installer_ca_lifecycle == 'keep-recovery' %}
                     <div class="muted">Keep: original admin kubeconfig CA</div>
@@ -3251,24 +3563,27 @@ HTML_TEMPLATE = '''
                     {% elif cert.cert_role == 'ca-bundle' %}
                     <span class="pill status-user" title="CA certificates loaded as a trust store (who this process will trust). A copy of CA public certs, not the private key.">ca-bundle</span>
                     {% else %}
-                    <span class="pill status-info" title="End-entity cert signed by a CA. Platform-managed leaves rotate on their own schedule (80% / refresh annotation), not the CA’s. Exceptions: localhost-recovery-serving-certkey (OCPSTRAT-1826) and user-managed leaves.">leaf</span>
+                    <span class="pill status-info" title="End-entity cert signed by a CA. Platform-managed leaves rotate on their own schedule (80% / refresh annotation), not the CA’s. Exceptions: localhost-recovery-serving-certkey and its static-pod revisions (foreverPeriod / OCPSTRAT-1826) and user-managed leaves.">leaf</span>
                     {% endif %}
                 </td>
-                <td class="why-cell">
+                <td class="why-cell hide-on-external">
                     {% if cert.no_rotate_label %}{{ cert.no_rotate_label }}{% endif %}
+                    {% if cert.scr_skip_label and not cert.is_forever_period %}
+                    <div{% if cert.no_rotate_label %} class="muted"{% endif %}>{{ cert.scr_skip_label }}</div>
+                    {% endif %}
                     {% if cert.installer_ca_note %}
                     <div class="muted">{{ cert.installer_ca_note }}</div>
                     {% endif %}
                     {% if cert.registry_why_lines %}
                         {% for line in cert.registry_why_lines %}
-                        <div{% if cert.no_rotate_label or cert.installer_ca_note or not loop.first %} class="muted"{% endif %}>{{ line }}</div>
+                        <div{% if cert.no_rotate_label or cert.scr_skip_label or cert.installer_ca_note or not loop.first %} class="muted"{% endif %}>{{ line }}</div>
                         {% endfor %}
-                    {% elif not cert.no_rotate_label and not cert.installer_ca_note %}
+                    {% elif not cert.no_rotate_label and not cert.scr_skip_label and not cert.installer_ca_note %}
                     —
                     {% endif %}
                 </td>
-                <td>{{ cert.key_type }}</td>
-                <td class="key-size-cell">
+                <td class="hide-on-external">{{ cert.key_type }}</td>
+                <td class="key-size-cell hide-on-external">
                     {% if cert.key_size %}
                         {% if cert.key_policy == 'below-4096-ca' %}
                         <span class="pill status-critical">{{ cert.key_size }} bits</span>
@@ -3302,7 +3617,7 @@ HTML_TEMPLATE = '''
                     {% endif %}
                 </td>
                 <td>{{ cert.rotate_at }} <span class="muted">{{ cert.rotate_at_source }}</span></td>
-                <td>
+                <td class="issuer-cell">
                     {% if cert.issuer_origin == 'external' %}
                     <span class="pill status-warning">external</span>
                     {% elif cert.issuer_origin == 'platform' %}
@@ -3310,8 +3625,16 @@ HTML_TEMPLATE = '''
                     {% else %}
                     <span class="pill status-user">{{ cert.issuer_origin }}</span>
                     {% endif %}
+                    {% set issuer_list = cert.issuers if cert.issuers else ([cert.issuer] if cert.issuer else []) %}
+                    {% if issuer_list %}
+                        {% for iss in issuer_list %}
+                        <code>{{ iss }}</code>
+                        {% endfor %}
+                    {% else %}
+                    <div class="muted">—</div>
+                    {% endif %}
                 </td>
-                <td>
+                <td class="hide-on-external">
                     {% if cert.tls_registry_status == 'uncovered' %}
                         {% if cert.known_origin_violation %}
                         <span class="pill status-critical">no owner</span>
@@ -3353,6 +3676,8 @@ function applyFilter(name) {
     else if (name === 'leaf') show = row.getAttribute('data-role') === 'leaf';
     else if (name === 'external') show = row.getAttribute('data-origin') === 'external';
     else if (name === 'tenyear') show = row.getAttribute('data-tenyear') === '1';
+    else if (name === 'foreverperiod') show = row.getAttribute('data-foreverperiod') === '1';
+    else if (name === 'notshortened') show = row.getAttribute('data-notshortened') === '1';
     else if (name === 'keypolicy') show = row.getAttribute('data-keypolicy') === 'below-4096-ca';
     else if (name === 'pastrotate') show = row.getAttribute('data-pastrotate') === '1';
     else if (name === 'usermanaged') show = row.getAttribute('data-usermanaged') === '1';
@@ -3375,7 +3700,9 @@ function applyFilter(name) {
   var panel = document.getElementById('uncovered-panel');
   if (panel) panel.style.display = (name === 'uncovered') ? '' : 'none';
   var nrot = document.getElementById('norotate-panel');
-  if (nrot) nrot.style.display = (name === 'tenyear') ? '' : 'none';
+  if (nrot) nrot.style.display = (name === 'tenyear' || name === 'foreverperiod') ? '' : 'none';
+  var scrp = document.getElementById('scr-panel');
+  if (scrp) scrp.style.display = (name === 'notshortened') ? '' : 'none';
   var notes = document.querySelectorAll('[data-filter-note]');
   for (var n = 0; n < notes.length; n++) {
     notes[n].style.display = (notes[n].getAttribute('data-filter-note') === name) ? '' : 'none';
@@ -3387,12 +3714,19 @@ function applyFilter(name) {
     leaf: 'Leaves',
     external: 'External issuers',
     tenyear: 'Certificates that will not auto-rotate',
+    foreverperiod: 'foreverPeriod (kube-apiserver 10y / OCPSTRAT-1826)',
+    notshortened: 'Not shortened by ShortCertRotation',
     keypolicy: 'RSA root CAs below 4096 bits',
     pastrotate: 'Past rotate-at',
     usermanaged: 'User-managed — action needed'
   };
   var heading = document.getElementById('cert-heading-label');
   if (heading) heading.textContent = headings[name] || 'Certificates';
+  var inv = document.getElementById('inventory-table');
+  if (inv) {
+    if (name === 'external') inv.classList.add('view-external');
+    else inv.classList.remove('view-external');
+  }
 }
 applyFilter('all');
 </script>
