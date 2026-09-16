@@ -1130,9 +1130,11 @@ def installer_keyless_lifecycle(name, cn):
 
 
 def management_display(managed_status, will_not_rotate, no_rotate_reason, injected_ca_copy,
-                       hypershift_referenced=False):
+                       hypershift_referenced=False, expired=False):
     """Who rotates this cert — not a health status."""
     if 'User-Managed' in (managed_status or ''):
+        if expired:
+            return 'Expired — user-managed, you rotate it', 'critical'
         if hypershift_referenced:
             return 'User-supplied (HyperShift copies it; you rotate it)', 'critical'
         return 'User-managed — action needed', 'critical'
@@ -1146,6 +1148,8 @@ def management_display(managed_status, will_not_rotate, no_rotate_reason, inject
         if no_rotate_reason == 'hypershift-10y':
             return 'Will not auto-rotate (10-year CA)', 'critical'
         return 'Will not auto-rotate', 'critical'
+    if expired:
+        return 'Expired — predicted rotation did not happen', 'critical'
     if injected_ca_copy:
         return 'Platform, injected CA copy', 'user'
     if 'Auto-Rotated' in (managed_status or '') and 'Not Auto-Rotated' not in (managed_status or ''):
@@ -1424,6 +1428,13 @@ def process_resource_obj(resource_type, obj, cert_data, has_private_key, cert_fi
         mgmt_label, mgmt_class = management_display(
             managed_status, will_not_rotate, no_rotate_reason, injected_ca_copy,
             hypershift_referenced=hs_ref,
+            expired=(
+                has_private_key
+                and cert_role != 'ca-bundle'
+                and not injected_ca_copy
+                and parsed.get('days_remaining') is not None
+                and parsed.get('days_remaining') < 0
+            ),
         )
         key_display = (
             f"{parsed['key_type']}-{parsed['key_size']}"
@@ -1686,14 +1697,8 @@ def summarize_certificates(certificates):
             1 for c in certificates if c.get('scr_skip_kind') == 'namespace'
         ),
         'below_4096_ca': sum(1 for c in certificates if c.get('key_policy') == 'below-4096-ca'),
-        'past_rotate_at': sum(
-            1 for c in certificates
-            if c.get('days_until_rotate') is not None and c.get('days_until_rotate') < 0
-            and not c.get('will_not_auto_rotate')
-            and c.get('has_private_key')
-            and c.get('cert_role') != 'ca-bundle'
-            and not c.get('injected_ca_copy')
-        ),
+        'past_rotate_at': sum(1 for c in certificates if c.get('filter_1990')),
+        'expired': sum(1 for c in certificates if c.get('filter_expired')),
         'registered': sum(1 for c in certificates if c.get('tls_registry_status') == 'registered'),
         'tls_registry': sum(1 for c in certificates if c.get('origin_kind')),
         'validity_over_5y': sum(1 for c in certificates if c.get('filter_2272')),
@@ -1871,7 +1876,7 @@ WORK_ACTIONS = {
     'rsa-ca-below-4096': 'Self-signed RSA signer below 4096 bits. OCPSTRAT-2271 (TP) / OCPSTRAT-3050 (GA) require 4096 for RSA root CAs; re-issue this signer key.',
     'user-managed': 'OpenShift will not rotate this because an administrator supplied it. Rotate it before expiry, or move it onto Service-CA / an operator. This is not OCPSTRAT-1826 (those are platform 10-year signers).',
     'user-managed-hypershift': 'HostedCluster named serving cert: HyperShift copies this Secret and does not regenerate it. You rotate it. This is not OCPSTRAT-1826 (those are platform 10-year signers).',
-    'past-rotate-at': 'Predicted rotate-at is in the past and this is not a will-not-rotate signer. Check the owning operator is reconciling (OCPSTRAT-1990 visibility).',
+    'past-rotate-at': 'Predicted rotate-at is in the past and this is not a will-not-rotate signer. Check the owning operator is reconciling (OCPSTRAT-1990 visibility). If notAfter is also past, the certificate is expired.',
     'validity-over-5y': 'Lifetime is over 5 years. HPSTRAT-99 / OCPSTRAT-2272 phase 1 is to cap platform certs at 5 years (then 2 years in phase 2).',
     'validity-over-2y': 'Lifetime is over 2 years and at most 5 years. OCPSTRAT-2273 phase 2 is to cap platform certs at 2 years.',
     'external-ca': 'Issuer DN is not classified as OpenShift internal PKI. OCPSTRAT-2029 is not a to-do to remove this: the Feature is a customer intermediate CA so platform certs can chain to an enterprise root while OpenShift still rotates them. Confirm this issuer is expected.',
@@ -1993,6 +1998,15 @@ def _has_key_not_bundle(cert):
     return True
 
 
+def _rotation_observable(cert):
+    """Secrets OCPSTRAT-1990 can talk about: key present, not a bundle or injected copy."""
+    if cert.get('injected_ca_copy') or cert.get('will_not_auto_rotate'):
+        return False
+    if cert.get('cert_role') == 'ca-bundle' or not cert.get('has_private_key'):
+        return False
+    return True
+
+
 def apply_inventory_filter_flags(cert):
     """Flags for the Feature filter strip (must match visible inventory rows)."""
     if not cert:
@@ -2004,6 +2018,16 @@ def apply_inventory_filter_flags(cert):
     cert['filter_2273'] = (
         _has_key_not_bundle(cert)
         and POLICY_2Y_DAYS < (cert.get('validity_days') or 0) <= POLICY_5Y_DAYS
+    )
+    cert['filter_1990'] = (
+        _rotation_observable(cert)
+        and cert.get('days_until_rotate') is not None
+        and cert.get('days_until_rotate') < 0
+    )
+    cert['filter_expired'] = (
+        _rotation_observable(cert)
+        and cert.get('days_remaining') is not None
+        and cert.get('days_remaining') < 0
     )
     return cert
 
@@ -2026,6 +2050,7 @@ def hpstrat99_tracker(certificates, counts):
     """
     certificates = [apply_inventory_filter_flags(c) for c in (certificates or []) if c]
     named_1826 = sum(1 for c in certificates if c.get('is_ocpstrat_1826'))
+    expired_n = sum(1 for c in certificates if c.get('filter_expired'))
     rotate_at_n = sum(
         1 for c in certificates
         if c.get('rotate_at') and not c.get('injected_ca_copy')
@@ -2095,7 +2120,8 @@ def hpstrat99_tracker(certificates, counts):
                 'gap': (
                     f'This console is the stand-in (rotate-at on {rotate_at_n} artifacts, '
                     f'{refresh_n} with certificates.openshift.io/refresh-period). '
-                    'The product API/CLI is not shipped. Count is secrets past predicted rotate-at.'
+                    'The product API/CLI is not shipped. Count is secrets past predicted rotate-at. '
+                    f'{expired_n} of those already have notAfter in the past (expired).'
                 ),
             },
             {
@@ -2187,7 +2213,10 @@ def workboard_report(certificates):
             continue
         if not c.get('has_private_key') or c.get('cert_role') == 'ca-bundle':
             continue
-        items.append(_work_item(c, 'past-rotate-at', 'past-rotate-at', status='stuck'))
+        items.append(_work_item(
+            c, 'past-rotate-at', 'past-rotate-at',
+            status='expired' if (c.get('days_remaining') is not None and c.get('days_remaining') < 0) else 'stuck',
+        ))
 
     for c in _unique_by_fingerprint(
         c for c in certificates
@@ -2808,14 +2837,14 @@ HTML_TEMPLATE = '''
         #inventory-table[class*="view-uncovered"] .col-evidence,
         #inventory-table.view-external .col-evidence,
         #inventory-table.view-ocpstrat-2271 .col-evidence,
-        #inventory-table.view-ocpstrat-1990 .col-evidence,
+        #inventory-table[class*="view-ocpstrat-1990"] .col-evidence,
         #inventory-table.view-usermanaged .col-evidence { display: table-cell; }
         #inventory-table .ev { display: none; }
         #inventory-table[class*="view-ocpstrat-1826"] .ev-1826,
         #inventory-table[class*="view-uncovered"] .ev-uncovered,
         #inventory-table.view-external .ev-external,
         #inventory-table.view-ocpstrat-2271 .ev-2271,
-        #inventory-table.view-ocpstrat-1990 .ev-1990,
+        #inventory-table[class*="view-ocpstrat-1990"] .ev-1990,
         #inventory-table.view-usermanaged .ev-usermanaged { display: block; }
         #inventory-table[class*="view-ocpstrat-1826"] .gap-pill { display: none; }
         .filter-group-label {
@@ -3039,8 +3068,8 @@ HTML_TEMPLATE = '''
             </div>
             <div class="summary-card" data-filter="ocpstrat-1990" onclick="applyFilter('ocpstrat-1990')">
                 <h3>OCPSTRAT-1990</h3>
-                <div class="summary-question">Secrets already past predicted rotate-at</div>
-                <div class="summary-count">{{ summary.past_rotate_at }}</div>
+                <div class="summary-question">Past predicted rotate-at; expired are flagged</div>
+                <div class="summary-count"{% if summary.expired %} style="color: #721C24;"{% endif %}>{{ summary.past_rotate_at }}</div>
             </div>
             <div class="summary-card" data-filter="uncovered" onclick="applyFilter('uncovered')">
                 <h3>OCPSTRAT-2655</h3>
@@ -3097,6 +3126,11 @@ HTML_TEMPLATE = '''
             <button type="button" data-filter="uncovered-new" onclick="applyFilter('uncovered-new')">new (CI fails) {{ summary.missing_owners_new }}</button>
             <button type="button" data-filter="uncovered-known" onclick="applyFilter('uncovered-known')">grandfathered {{ summary.missing_owners_known }}</button>
         </div>
+        <div id="1990-subfilters" class="filters" style="display: none;">
+            <span class="muted">OCPSTRAT-1990 questions:</span>
+            <button type="button" data-filter="ocpstrat-1990" onclick="applyFilter('ocpstrat-1990')">All past rotate-at {{ summary.past_rotate_at }}</button>
+            <button type="button" data-filter="ocpstrat-1990-expired" onclick="applyFilter('ocpstrat-1990-expired')">expired {{ summary.expired }}</button>
+        </div>
     </div>
 
     <div id="filter-notes">
@@ -3150,7 +3184,15 @@ HTML_TEMPLATE = '''
         <div class="warn-box filter-note" data-filter-note="ocpstrat-1990" style="display: none;">
             <a href="https://issues.redhat.com/browse/OCPSTRAT-1990" target="_blank" rel="noopener noreferrer">OCPSTRAT-1990</a>:
             secrets with a private key whose predicted rotate-at is past
-            (not will-not-rotate, not user-managed, not CA-bundle copies).
+            (not will-not-rotate, not CA-bundle copies). Use <strong>expired</strong> for the
+            subset whose <code>notAfter</code> is also past.
+            {{ summary.expired }} expired of {{ summary.past_rotate_at }} past rotate-at.
+        </div>
+        <div class="warn-box filter-note" data-filter-note="ocpstrat-1990-expired" style="display: none;">
+            <a href="https://issues.redhat.com/browse/OCPSTRAT-1990" target="_blank" rel="noopener noreferrer">OCPSTRAT-1990</a>
+            question 2: the certificate itself is expired (<code>notAfter</code> is in the past).
+            Predicted rotate-at was earlier; the owning operator did not replace the secret.
+            Static-pod CA-bundle revisions are omitted (old copies, not the live signer).
         </div>
         <div class="warn-box filter-note" data-filter-note="uncovered" style="display: none;">
             <a href="https://issues.redhat.com/browse/OCPSTRAT-2655" target="_blank" rel="noopener noreferrer">OCPSTRAT-2655</a>:
@@ -3302,7 +3344,8 @@ HTML_TEMPLATE = '''
                 data-2272="{{ '1' if cert.filter_2272 else '0' }}"
                 data-2273="{{ '1' if cert.filter_2273 else '0' }}"
                 data-keypolicy="{{ cert.key_policy }}"
-                data-pastrotate="{{ '1' if cert.days_until_rotate is not none and cert.days_until_rotate < 0 and not cert.will_not_auto_rotate and cert.has_private_key and cert.cert_role != 'ca-bundle' and not cert.injected_ca_copy else '0' }}"
+                data-pastrotate="{{ '1' if cert.filter_1990 else '0' }}"
+                data-expired="{{ '1' if cert.filter_expired else '0' }}"
                 data-usermanaged="{{ '1' if 'User-Managed' in cert.managed_status else '0' }}"
                 data-known="{{ '1' if cert.known_origin_violation else '0' }}"
             >
@@ -3311,7 +3354,9 @@ HTML_TEMPLATE = '''
                     {% if cert.copy_count and cert.copy_count > 1 %}
                     <div class="muted" title="{{ (cert.copy_namespaces or []) | join(', ') }}">×{{ cert.copy_count }} copies</div>
                     {% endif %}
-                    {% if cert.is_forever_period %}
+                    {% if cert.filter_expired %}
+                    <div class="gap-pill"><span class="pill status-critical">expired</span></div>
+                    {% elif cert.is_forever_period %}
                     <div class="gap-pill"><span class="pill status-critical">foreverPeriod</span></div>
                     {% elif cert.not_shortened_by_scr %}
                     <div class="gap-pill"><span class="pill status-warning">SCR skip</span></div>
@@ -3410,6 +3455,12 @@ HTML_TEMPLATE = '''
                         {% endif %}
                     </div>
                     <div class="ev ev-1990">
+                        {% if cert.filter_expired %}
+                        <span class="pill status-critical">expired</span>
+                        {% if cert.days_remaining is not none %}
+                        <div class="muted">notAfter {{ cert.expires or '—' }} · {{ -cert.days_remaining }}d ago</div>
+                        {% endif %}
+                        {% endif %}
                         {{ cert.rotate_at or '—' }}
                         {% if cert.rotate_at_source %}
                         <div class="muted">{{ cert.rotate_at_source }}{% if cert.days_until_rotate is not none %} · {{ cert.days_until_rotate }}d{% endif %}</div>
@@ -3487,6 +3538,7 @@ var currentFilter = 'all';
 function chipActive(chipFilter, name) {
   if (chipFilter === name) return true;
   if (chipFilter === 'ocpstrat-1826' && name.indexOf('ocpstrat-1826') === 0) return true;
+  if (chipFilter === 'ocpstrat-1990' && name.indexOf('ocpstrat-1990') === 0) return true;
   if (chipFilter === 'uncovered' && name.indexOf('uncovered') === 0) return true;
   return false;
 }
@@ -3513,6 +3565,7 @@ function applyFilter(name) {
     else if (name === 'ocpstrat-2273') show = row.getAttribute('data-2273') === '1';
     else if (name === 'ocpstrat-2271') show = row.getAttribute('data-keypolicy') === 'below-4096-ca';
     else if (name === 'ocpstrat-1990') show = row.getAttribute('data-pastrotate') === '1';
+    else if (name === 'ocpstrat-1990-expired') show = row.getAttribute('data-expired') === '1';
     else if (name === 'ocpstrat-2029' || name === 'ocpstrat-1346') show = false;
     else if (name === 'usermanaged') show = row.getAttribute('data-usermanaged') === '1';
     row.style.display = show ? '' : 'none';
@@ -3547,6 +3600,8 @@ function applyFilter(name) {
   if (sub1826) sub1826.style.display = (name.indexOf('ocpstrat-1826') === 0) ? '' : 'none';
   var sub2655 = document.getElementById('2655-subfilters');
   if (sub2655) sub2655.style.display = (name.indexOf('uncovered') === 0) ? '' : 'none';
+  var sub1990 = document.getElementById('1990-subfilters');
+  if (sub1990) sub1990.style.display = (name.indexOf('ocpstrat-1990') === 0) ? '' : 'none';
   var notes = document.querySelectorAll('[data-filter-note]');
   for (var n = 0; n < notes.length; n++) {
     notes[n].style.display = (notes[n].getAttribute('data-filter-note') === name) ? '' : 'none';
@@ -3568,6 +3623,7 @@ function applyFilter(name) {
     'ocpstrat-2273': 'OCPSTRAT-2273 — validity 2–5y',
     'ocpstrat-2271': 'OCPSTRAT-2271 / 3050 — RSA CA below 4096',
     'ocpstrat-1990': 'OCPSTRAT-1990 — past rotate-at',
+    'ocpstrat-1990-expired': 'OCPSTRAT-1990 — expired (notAfter past)',
     'ocpstrat-2029': 'OCPSTRAT-2029 — not visible as PEMs',
     'ocpstrat-1346': 'OCPSTRAT-1346 — not visible as PEMs',
     usermanaged: 'User-managed — action needed'
@@ -3586,6 +3642,7 @@ function applyFilter(name) {
     external: 'Issuer DN',
     'ocpstrat-2271': 'Key size',
     'ocpstrat-1990': 'Rotate-at',
+    'ocpstrat-1990-expired': 'Expired / rotate-at',
     usermanaged: 'Days left'
   };
   var eh = document.getElementById('evidence-heading');
