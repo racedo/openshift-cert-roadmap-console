@@ -74,7 +74,7 @@ There is **no image build**. `./deploy.sh` loads `Container/app.py` into a Confi
 
 Live artifacts on this API are grouped under the [HPSTRAT-99](https://issues.redhat.com/browse/HPSTRAT-99) Features they motivate, including:
 
-- [OCPSTRAT-1826](https://issues.redhat.com/browse/OCPSTRAT-1826) — 10-year / foreverPeriod signers that will not auto-rotate
+- [OCPSTRAT-1826](https://issues.redhat.com/browse/OCPSTRAT-1826) — verified create-once HyperShift CAs and static installer trust certificates
 - [OCPSTRAT-2272](https://issues.redhat.com/browse/OCPSTRAT-2272) / [OCPSTRAT-2273](https://issues.redhat.com/browse/OCPSTRAT-2273) — platform validity still over 5 years, then over 2 years
 - [OCPSTRAT-2271](https://issues.redhat.com/browse/OCPSTRAT-2271) / [OCPSTRAT-3050](https://issues.redhat.com/browse/OCPSTRAT-3050) — RSA root CAs still below 4096 bits
 - [OCPSTRAT-2029](https://issues.redhat.com/browse/OCPSTRAT-2029) — external CA for platform certificates (capability; not a PEM list)
@@ -95,3 +95,41 @@ Platform TLS collector rules: [OpenShift TLS registry](https://github.com/opensh
 ## License
 
 Apache-2.0
+
+## Rotation classification
+
+Ten-year validity does not imply that a certificate never rotates. Kube-apiserver
+`foreverPeriod` signers and the recovery serving certificate renew at about eight
+years; static-pod revisions are historical copies. MCS and CNO also use automatic
+renewal. For library-go signers, the predicted age trigger is the earlier of 80%
+of validity and the configured refresh period (including CNO's nine-year refresh).
+
+The non-rotating inventory requires an approximately ten-year CA plus an established
+create-once controller: HyperShift ownership metadata and a known CA resource name,
+or one of the two dedicated installer trust ConfigMaps in its expected namespace.
+CAPI webhook and ignition CAs are included. Secret key detection includes `ca.key`
+and checks that the private key matches the selected certificate. Unique CA counts
+inherit these object verdicts by fingerprint; embedded CAs never inherit a leaf key.
+
+Other long-lived keyed CAs are labelled **rotation unverified**, excluded from the
+confirmed non-rotating count, and given no predicted renewal date. In particular,
+local cluster-proxy source retains its existing CA, but its deployed MCE source
+revision has not been verified. The API exposes these rows as `rotation_unverified`.
+No automatic date is assigned to create-once CAs or historical revisions either.
+The legacy `/api/certificates` field `ocpstrat_1826` remains a reference inventory of
+the five kube-apiserver names, explicitly marked `rotation_policy: automatic-8y`;
+use `will_not_auto_rotate` and `unique_non_rotating_cas` for the actual non-rotating set.
+
+Source evidence:
+
+- [Released kube-apiserver rotation controller](https://github.com/openshift/cluster-kube-apiserver-operator/blob/fb68eab51544f9dffac9916796723f6cee4faf3c/pkg/operator/certrotationcontroller/certrotationcontroller.go)
+- [HyperShift create-once CA helper](https://github.com/openshift/hypershift/blob/b6019f3b0bded95641d4f9c15a6253ffc36e2b04/support/certs/tls.go#L448)
+- [HyperShift CAPI certificate guard](https://github.com/openshift/hypershift/blob/b6019f3b0bded95641d4f9c15a6253ffc36e2b04/control-plane-operator/controllers/hostedcontrolplane/v2/capi_manager/secret.go)
+- [HyperShift ignition CA](https://github.com/openshift/hypershift/blob/b6019f3b0bded95641d4f9c15a6253ffc36e2b04/control-plane-operator/controllers/hostedcontrolplane/v2/ignitionserver/pki.go)
+- [CNO library-go 80% trigger](https://github.com/openshift/cluster-network-operator/blob/e20b9cb9a0b3bc293e622ef1caf70a813710ffa8/vendor/github.com/openshift/library-go/pkg/operator/certrotation/signer.go#L168)
+
+Run regression tests without a cluster (after installing `Container/requirements.txt`):
+
+```bash
+python -m unittest discover -s tests -v
+```

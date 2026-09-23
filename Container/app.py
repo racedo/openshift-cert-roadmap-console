@@ -22,7 +22,7 @@ from kubernetes import client, config
 from kubernetes.client.rest import ApiException
 from cryptography import x509
 from cryptography.hazmat.backends import default_backend
-from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import dsa, ec, ed25519, ed448, rsa
 try:
     import yaml
@@ -337,10 +337,9 @@ def save_discovery_to_db(certificates, cluster_name, duration):
         logger.error(f"Error saving discovery to database: {e}", exc_info=True)
         return None
 
-# kube-apiserver operator foreverPeriod secrets (OCPSTRAT-1826).
-# certrotationcontroller.go: Refresh at 80% of 10y is 8y, "we effectively do not rotate".
-# ShortCertRotation skips ValidityDuration == "10y". Manual rotation is the Feature, not shipped.
-OCPSTRAT_1826_NO_ROTATE = frozenset({
+# kube-apiserver foreverPeriod is a ten-year lifetime, NOT a rotation opt-out.
+# The controller and library-go refresh these certificates at eight years (80%).
+KUBE_APISERVER_LONG_CYCLE = frozenset({
     'localhost-serving-signer',
     'service-network-serving-signer',
     'loadbalancer-serving-signer',
@@ -372,14 +371,15 @@ INSTALLER_KEYLESS_NOTES = {
 TEN_YEAR_DAYS = 3650
 # Floor so 3649d leap/day rounding still counts. Rotating signers that reuse
 # HyperShift names are 30d, 60d, 1y, or 5y — well below this.
-TEN_YEAR_MIN_DAYS = TEN_YEAR_DAYS - 365
+TEN_YEAR_MIN_DAYS = TEN_YEAR_DAYS - 2
+TEN_YEAR_MAX_DAYS = TEN_YEAR_DAYS + 3
 # HPSTRAT-99 / OCPSTRAT-2272 / 2273 policy: OpenShift days, not calendar years.
 POLICY_5Y_DAYS = 5 * 365
 POLICY_2Y_DAYS = 2 * 365
 LIST_PAGE_SIZE = 500
 MAX_PARSE_CERTS_PER_PEM = 8
 SECRET_CERT_FIELDS = ('tls.crt', 'ca.crt', 'cert.crt')
-SECRET_KEY_FIELDS = ('tls.key', 'cert.key')
+SECRET_KEY_FIELDS = ('tls.key', 'cert.key', 'ca.key')
 # library-go InspectConfigMap CA bundle keys (origin TLS registry).
 ORIGIN_CA_BUNDLE_KEYS = (
     'ca-bundle.crt',
@@ -403,7 +403,7 @@ ORIGIN_OWNERSHIP_VIOLATIONS = (
 ORIGIN_OWNERSHIP_VIOLATION_KEYS = frozenset(
     (ns, name) for _kind, ns, name in ORIGIN_OWNERSHIP_VIOLATIONS
 )
-# CNO OperatorPKI (ovn-ca, signer-ca): 10y validity, Refresh after 9y — they DO auto-rotate.
+# CNO configures 9y refresh, but library-go triggers earlier at 80% (8y).
 CNO_OPERATOR_PKI_SIGNERS = frozenset({
     'ovn-ca',
     'signer-ca',
@@ -411,6 +411,8 @@ CNO_OPERATOR_PKI_SIGNERS = frozenset({
 # HyperShift CPO ReconcileSelfSignedCA: 10y, no-op if the secret already has a CA.
 # Only flag when the secret still holds a private key (management cluster), not guest copies.
 HYPERSHIFT_TEN_YEAR_CAS = frozenset({
+    'capi-webhooks-tls',
+    'ignition-server-ca-cert',
     'root-ca',
     'etcd-signer',
     'etcd-metrics-signer',
@@ -425,25 +427,6 @@ HYPERSHIFT_TEN_YEAR_CAS = frozenset({
     'cluster-signer-ca',
     'csr-signer',
 })
-# CNs of CAs that do not auto-rotate (OCPSTRAT-1826, installer, HyperShift ReconcileSelfSignedCA).
-# Match the PEM subject, not only the secret name — hosted guests often store these as copies.
-KNOWN_NON_ROTATE_CN = frozenset({
-    'kube-apiserver-localhost-signer',
-    'kube-apiserver-service-network-signer',
-    'kube-apiserver-lb-signer',
-    'localhost-recovery-serving-signer',
-    'kubelet-bootstrap-kubeconfig-signer',
-    'admin-kubeconfig-signer',
-    'kube-apiserver-to-kubelet-signer',
-    'kube-csr-signer',
-    'kube-control-plane-signer',
-    'root-ca',
-    'etcd-signer',
-    'etcd-metrics-signer',
-    'konnectivity-signer',
-    'aggregator-signer',
-    'hcco-signer',
-})
 OCPSTRAT_1826_EXPECTED = (
     'localhost-serving-signer',
     'service-network-serving-signer',
@@ -451,7 +434,7 @@ OCPSTRAT_1826_EXPECTED = (
     'localhost-recovery-serving-signer',
     'localhost-recovery-serving-certkey',
 )
-FOREVER_PERIOD_SIGNERS = OCPSTRAT_1826_NO_ROTATE - {'localhost-recovery-serving-certkey'}
+FOREVER_PERIOD_SIGNERS = KUBE_APISERVER_LONG_CYCLE - {'localhost-recovery-serving-certkey'}
 FOREVER_PERIOD_LEAFS = frozenset({'localhost-recovery-serving-certkey'})
 # Static-pod revisions of the recovery leaf (localhost-recovery-serving-certkey-2, …).
 FOREVER_PERIOD_CERTKEY_RE = re.compile(r'^localhost-recovery-serving-certkey(?:-\d+)?$')
@@ -466,7 +449,7 @@ def is_forever_period_leaf_name(name):
 
 
 def is_forever_period_name(name):
-    """kube-apiserver-operator Validity: foreverPeriod artifacts (OCPSTRAT-1826)."""
+    """kube-apiserver certificates with ten-year validity and automatic renewal."""
     if not name:
         return False
     if name in FOREVER_PERIOD_SIGNERS:
@@ -510,11 +493,11 @@ SCR_UNSHORTENED_EXPECTED = (
 )
 SCR_SKIP_LABELS = {
     'foreverPeriod': (
-        'foreverPeriod — ShortCertRotation does not shorten 10y (OCPSTRAT-1826)'
+        'foreverPeriod — 10y validity, automatic refresh at 8y; not shortened by SCR'
     ),
     '10y': (
         '10y ValidityDuration — ShortCertRotation does not shorten this '
-        '(payload test skip). OVN/NNI CAs still refresh at 9y; MCS at 8y.'
+        '(payload test skip). OVN/NNI and MCS CAs refresh at about 8y.'
     ),
     'namespace': (
         'Owning operator does not use ShortCertRotation '
@@ -659,6 +642,9 @@ def parse_certificate(cert_data):
 
     return {
         'fingerprint': cert.fingerprint(hashes.SHA256()).hex().upper(),
+        'public_key_fingerprint': hashlib.sha256(cert.public_key().public_bytes(
+            serialization.Encoding.DER, serialization.PublicFormat.SubjectPublicKeyInfo
+        )).hexdigest(),
         'issuer': cert.issuer.rfc4514_string(),
         'subject': cert.subject.rfc4514_string(),
         'not_before': not_before,
@@ -704,14 +690,8 @@ def select_primary_cert(name, certs):
 
 
 def is_ten_year_lifetime(validity_days):
-    """True for OpenShift ~10-year CAs (typically 3650 days).
-
-    HyperShift ReconcileSelfSignedCA uses the same secret names as rotating
-    library-go signers (aggregator-client-signer, csr-signer,
-    kube-control-plane-signer, etcd-signer, kube-apiserver-to-kubelet-signer).
-    Those rotating certs are 30d–5y; only a ~10y lifetime is the no-rotate gap.
-    """
-    return (validity_days or 0) >= TEN_YEAR_MIN_DAYS
+    """Approximately ten years, allowing certificate timestamp/day rounding."""
+    return TEN_YEAR_MIN_DAYS <= (validity_days or 0) <= TEN_YEAR_MAX_DAYS
 
 
 def validity_label(days):
@@ -753,58 +733,29 @@ def cert_public_fields(parsed):
     }
 
 
-def non_rotate_reason_for_cert(name, parsed):
-    """Return reason if this PEM is a 10-year CA that OpenShift will not auto-rotate."""
-    if not parsed or not is_ten_year_lifetime(parsed.get('validity_days')):
-        return ''
-    if name in CNO_OPERATOR_PKI_SIGNERS or name in STILL_AUTO_ROTATES_10Y:
-        return ''
-    cn = subject_cn(parsed.get('subject'))
-    if name in OCPSTRAT_1826_NO_ROTATE or cn in {
-        'kube-apiserver-localhost-signer',
-        'kube-apiserver-service-network-signer',
-        'kube-apiserver-lb-signer',
-        'localhost-recovery-serving-signer',
-    }:
-        return 'ocpstrat-1826'
-    if name in INSTALLER_NO_ROTATE or cn in {
-        'admin-kubeconfig-signer',
-        'kubelet-bootstrap-kubeconfig-signer',
-    }:
-        return 'installer-10y'
-    if (
-        name in HYPERSHIFT_TEN_YEAR_CAS
-        or cn in KNOWN_NON_ROTATE_CN
-    ):
-        return 'hypershift-10y'
-    return ''
-
-
-def compute_rotate_at(parsed, annotations, will_not_rotate, name=None):
-    """Rotate-at from refresh-period annotation, CNO 9y refresh, else library-go 80%."""
-    not_before = parsed['not_before']
-    not_after = parsed['not_after']
-    validity = parsed['validity']
-    rotate_80 = not_after - (validity / 5)
+def compute_rotate_at(parsed, annotations, will_not_rotate, name=None,
+                      rotation_unverified=False, historical_revision=False):
+    """Library-go age estimate; create-once and unverified CAs have no schedule."""
     refresh_raw = (annotations or {}).get('certificates.openshift.io/refresh-period', '')
+    if will_not_rotate or rotation_unverified or historical_revision:
+        mode = ('historical-copy' if historical_revision else
+                'unverified' if rotation_unverified else 'no-automatic-renewal')
+        return dict(rotate_at=None, rotate_at_iso=None, rotate_at_source='',
+                    refresh_period=refresh_raw, days_until_rotate=None, rotation_mode=mode)
+    not_before, not_after = parsed['not_before'], parsed['not_after']
+    rotate_at = not_after - (parsed['validity'] / 5)
+    source = '80-percent-estimate'
     period = parse_openshift_duration(refresh_raw)
-    if period:
+    if period and period > timedelta(0) and not_before + period < rotate_at:
         rotate_at = not_before + period
         source = 'refresh-period'
-    elif name in CNO_OPERATOR_PKI_SIGNERS:
-        rotate_at = not_before + timedelta(days=9 * 365)
-        source = 'cno-9y'
-    else:
-        rotate_at = rotate_80
-        source = '80-percent'
-    now = datetime.now(timezone.utc)
     return {
         'rotate_at': rotate_at.strftime('%Y-%m-%d'),
         'rotate_at_iso': rotate_at.isoformat(),
         'rotate_at_source': source,
         'refresh_period': refresh_raw,
-        'days_until_rotate': (rotate_at - now).days,
-        'rotation_mode': 'manual' if will_not_rotate else source,
+        'days_until_rotate': (rotate_at - datetime.now(timezone.utc)).days,
+        'rotation_mode': source,
     }
 
 
@@ -828,6 +779,8 @@ def determine_cert_role(resource_type, name, data_fields, annotations, labels, p
         pem_cert_count > 1 or (name or '').endswith('-signer') or name in HYPERSHIFT_TEN_YEAR_CAS
     ):
         return 'ca-bundle'
+    if has_private_key and parsed.get('is_ca'):
+        return 'signer'
     if 'tls.crt' not in fields and fields.intersection({'ca-bundle.crt', 'ca.crt'}):
         return 'ca-bundle'
     if resource_type == 'configmap' and fields and fields.issubset(CA_BUNDLE_FIELDS):
@@ -1059,59 +1012,52 @@ def unique_issuer_dns(pem_certs, fallback=''):
     return seen
 
 
+def has_hypershift_provenance(obj):
+    """Require a HostedControlPlane owner or the controller's cluster annotation."""
+    annotations = obj.metadata.annotations or {}
+    if is_hypershift_referenced(annotations):
+        return False
+    if annotations.get('hypershift.openshift.io/cluster'):
+        return True
+    return any(
+        ref.kind == 'HostedControlPlane'
+        and (ref.api_version or '').startswith('hypershift.openshift.io/')
+        for ref in (obj.metadata.owner_references or [])
+    )
+
+
 def classify_no_auto_rotate(name, cert_role, validity_days, injected_ca_copy,
                             resource_type='secret', has_private_key=False,
-                            pem_certs=None):
-    """Resources whose *secret* will not auto-rotate.
+                            pem_certs=None, namespace='', hypershift_owned=False):
+    """Only established create-once CAs and dedicated installer trust artifacts.
 
-    Named lists (OCPSTRAT-1826, installer, HyperShift) only explain *why*.
-    They must not override lifetime: HyperShift ReconcileSelfSignedCA 10y CAs
-    share names with rotating library-go signers on standalone/management
-    clusters. Serving leaves that embed a 10y signer in tls.crt still rotate.
-    CA bundles and other keyless copies that merely *contain* a 10-year CA
-    are not will-not-rotate work items (the signer secret with the key is).
-    Exception: a dedicated leftover installer CA (single PEM, no private key)
-    never rotates because the key was deleted with the bootstrap machine.
+    Lifetime and common name alone cannot prove which controller owns a CA.
+    Kube-apiserver foreverPeriod certificates rotate at 80% and are excluded.
     """
-    if name in CNO_OPERATOR_PKI_SIGNERS or name in STILL_AUTO_ROTATES_10Y:
+    primary = select_primary_cert(name, pem_certs or [])
+    if not primary or not primary.get('is_ca') or injected_ca_copy:
         return False, ''
-    if injected_ca_copy:
+    if not is_ten_year_lifetime(primary.get('validity_days', validity_days)):
         return False, ''
-    certs = pem_certs or []
-    primary = select_primary_cert(name, certs) if certs else None
-    days = (primary or {}).get('validity_days')
-    if days is None:
-        days = validity_days
-    if not is_ten_year_lifetime(days):
-        return False, ''
-    if is_forever_period_name(name):
-        return True, 'ocpstrat-1826'
-    if name in INSTALLER_NO_ROTATE:
-        return True, 'installer-10y'
-    cn = subject_cn((primary or {}).get('subject'))
-    if (
-        not has_private_key
-        and len(certs) == 1
-        and cn in INSTALLER_KEYLESS_CA_CN
-    ):
+    installer_copies = {
+        ('openshift-config', 'admin-kubeconfig-client-ca'): 'admin-kubeconfig-signer',
+        ('openshift-config-managed', 'kubelet-bootstrap-kubeconfig'): 'kubelet-bootstrap-kubeconfig-signer',
+    }
+    if (resource_type == 'configmap' and not has_private_key
+            and len(pem_certs or []) == 1
+            and installer_copies.get((namespace, name)) == subject_cn(primary.get('subject'))):
         return True, 'installer-10y-keyless'
-    if cert_role == 'ca-bundle' or not has_private_key:
+    if resource_type != 'secret' or not has_private_key or cert_role != 'signer':
         return False, ''
-    if cert_role == 'leaf':
-        return False, ''
-    if name in HYPERSHIFT_TEN_YEAR_CAS:
+    if hypershift_owned and name in HYPERSHIFT_TEN_YEAR_CAS:
         return True, 'hypershift-10y'
-    if len(certs) > 8:
-        return False, ''
-    reason = non_rotate_reason_for_cert(name, primary)
-    return (True, reason) if reason else (False, '')
+    return False, ''
 
 
 NO_ROTATE_LABELS = {
-    'ocpstrat-1826': 'OCPSTRAT-1826 foreverPeriod',
     'installer-10y': 'Installer 10-year signer',
     'installer-10y-keyless': 'Installer leftover CA (no key)',
-    'hypershift-10y': 'HyperShift 10-year CA',
+    'hypershift-10y': 'HyperShift create-once CA',
 }
 
 
@@ -1332,7 +1278,7 @@ def listed_cert_pem(resource_type, obj):
     """Pull PEM and field names from a list payload (no extra GET)."""
     if resource_type == 'secret':
         data = obj.data or {}
-        fields = [k for k in ('tls.crt', 'tls.key', 'ca.crt', 'cert.crt', 'cert.key') if k in data]
+        fields = [k for k in ('tls.crt', 'tls.key', 'ca.crt', 'cert.crt', 'cert.key', 'ca.key') if k in data]
         pem = None
         for field in SECRET_CERT_FIELDS:
             if field in data:
@@ -1364,6 +1310,22 @@ def listed_cert_pem(resource_type, obj):
     return pem, False, fields
 
 
+def private_key_matches(parsed, data):
+    """Check key correspondence without retaining or exposing private material."""
+    for field in SECRET_KEY_FIELDS:
+        if not (data or {}).get(field):
+            continue
+        try:
+            key = serialization.load_pem_private_key(base64.b64decode(data[field]), password=None)
+            public = key.public_key().public_bytes(
+                serialization.Encoding.DER, serialization.PublicFormat.SubjectPublicKeyInfo)
+            if hashlib.sha256(public).hexdigest() == parsed.get('public_key_fingerprint'):
+                return True
+        except (ValueError, TypeError):
+            continue
+    return False
+
+
 def process_resource_obj(resource_type, obj, cert_data, has_private_key, cert_fields):
     """Classify a secret or configmap already loaded from a list response."""
     try:
@@ -1379,6 +1341,8 @@ def process_resource_obj(resource_type, obj, cert_data, has_private_key, cert_fi
         parsed = select_primary_cert(name, pem_certs)
         if not parsed or not parsed.get('issuer'):
             return None
+        if resource_type == 'secret':
+            has_private_key = private_key_matches(parsed, obj.data)
         pem_cert_count = raw_pem_count or len(pem_certs)
 
         issuer = parsed['issuer']
@@ -1397,7 +1361,8 @@ def process_resource_obj(resource_type, obj, cert_data, has_private_key, cert_fi
         )
         will_not_rotate, no_rotate_reason = classify_no_auto_rotate(
             name, cert_role, validity_days, injected_ca_copy, resource_type,
-            has_private_key=has_private_key, pem_certs=pem_certs
+            has_private_key=has_private_key, pem_certs=pem_certs,
+            namespace=namespace, hypershift_owned=has_hypershift_provenance(obj)
         )
         installer_lifecycle = (
             installer_keyless_lifecycle(name, subject_cn(parsed.get('subject')))
@@ -1410,7 +1375,32 @@ def process_resource_obj(resource_type, obj, cert_data, has_private_key, cert_fi
             resource_type, name, namespace, cert_data, issuer, validity_days,
             annotations, labels, will_not_rotate
         )
-        rotation = compute_rotate_at(parsed, annotations, will_not_rotate, name)
+        historical_revision = (is_forever_period_leaf_name(name)
+                               and name != 'localhost-recovery-serving-certkey')
+        known_long_cycle = (
+            (namespace == 'openshift-kube-apiserver-operator' and name in FOREVER_PERIOD_SIGNERS)
+            or (namespace == 'openshift-kube-apiserver' and is_forever_period_leaf_name(name))
+            or (namespace, name) in SCR_UNSHORTENED_10Y_SECRETS
+            or (has_hypershift_provenance(obj) and name in CNO_OPERATOR_PKI_SIGNERS)
+        )
+        rotation_unverified = bool(
+            parsed.get('is_ca') and has_private_key and validity_days >= TEN_YEAR_MIN_DAYS
+            and not will_not_rotate and not known_long_cycle
+        )
+        rotation_evidence = (
+            'HyperShift controller retains existing CA; no age-based renewal'
+            if no_rotate_reason == 'hypershift-10y' else
+            'Static installer trust certificate; no active signing key on this API'
+            if no_rotate_reason == 'installer-10y-keyless' else
+            'Local cluster-proxy source retains existing CA; deployed source revision unverified'
+            if namespace == 'multicluster-engine' and name == 'cluster-proxy-signer' else
+            'Controller renewal policy not verified' if rotation_unverified else
+            'Historical revision of an automatically rotating certificate' if historical_revision else
+            'Library-go automatic renewal at 80% or earlier configured refresh'
+            if known_long_cycle else 'Rotation date is an estimate; controller policy may differ'
+        )
+        rotation = compute_rotate_at(parsed, annotations, will_not_rotate, name,
+                                     rotation_unverified, historical_revision)
         ca_category = determine_ca_category(issuer, annotations)
         issuer_origin = determine_issuer_origin(issuer, ca_category)
         tls_registry_status = determine_tls_registry_status(
@@ -1436,6 +1426,12 @@ def process_resource_obj(resource_type, obj, cert_data, has_private_key, cert_fi
                 and parsed.get('days_remaining') < 0
             ),
         )
+        if rotation_unverified:
+            managed_status = 'Platform-Managed (Rotation Unverified)'
+            mgmt_label, mgmt_class = 'Rotation unverified — see evidence', 'warning'
+        elif historical_revision:
+            managed_status = 'Platform-Managed (Historical Copy)'
+            mgmt_label, mgmt_class = 'Historical revision of rotating certificate', 'user'
         key_display = (
             f"{parsed['key_type']}-{parsed['key_size']}"
             if parsed.get('key_size')
@@ -1508,8 +1504,11 @@ def process_resource_obj(resource_type, obj, cert_data, has_private_key, cert_fi
             'installer_ca_note': INSTALLER_KEYLESS_NOTES.get(installer_lifecycle, ''),
             'is_forever_period_signer': name in FOREVER_PERIOD_SIGNERS,
             'is_forever_period_leaf': is_forever_period_leaf_name(name),
-            'is_forever_period': is_forever_period_name(name) and will_not_rotate,
-            'is_ocpstrat_1826': is_forever_period_name(name) and will_not_rotate,
+            'is_forever_period': is_forever_period_name(name),
+            'is_ocpstrat_1826': will_not_rotate,
+            'rotation_unverified': rotation_unverified,
+            'rotation_evidence': rotation_evidence,
+            'historical_revision': historical_revision,
             'scr_skip_kind': scr_skip_kind,
             'scr_skip_label': SCR_SKIP_LABELS.get(scr_skip_kind, ''),
             'not_shortened_by_scr': bool(scr_skip_kind),
@@ -1678,6 +1677,7 @@ def summarize_certificates(certificates):
         'external_issuers': sum(1 for c in certificates if c.get('issuer_origin') == 'external'),
         'ten_year': sum(1 for c in certificates if c.get('will_not_auto_rotate')),
         'will_not_auto_rotate': sum(1 for c in certificates if c.get('will_not_auto_rotate')),
+        'rotation_unverified': sum(1 for c in certificates if c.get('rotation_unverified')),
         'forever_period_signers': sum(1 for c in certificates if c.get('is_forever_period_signer')),
         'forever_period': sum(1 for c in certificates if c.get('is_forever_period')),
         'not_shortened_by_scr': sum(1 for c in certificates if c.get('not_shortened_by_scr')),
@@ -1707,7 +1707,7 @@ def summarize_certificates(certificates):
 
 
 def ocpstrat_1826_inventory(certificates):
-    """The five OCPSTRAT-1826 named secrets vs what this API actually has."""
+    """Legacy API reference list: these five long-cycle certificates rotate."""
     rows = []
     for name in OCPSTRAT_1826_EXPECTED:
         if name == 'localhost-recovery-serving-certkey':
@@ -1719,6 +1719,8 @@ def ocpstrat_1826_inventory(certificates):
         revision_names = sorted({c.get('name') for c in hits if c.get('name')})
         rows.append({
             'name': name,
+            'will_not_auto_rotate': False,
+            'rotation_policy': 'automatic-8y',
             'found': bool(hits),
             'on_this_api': bool(hits),
             'namespaces': sorted({c.get('namespace') for c in hits if c.get('namespace')}),
@@ -1770,7 +1772,7 @@ def short_cert_rotation_inventory(certificates):
             'owning_description': (primary or {}).get('owning_description') or '',
             'revision_count': len(hits),
             'revision_names': revision_names,
-            'in_1826_scope': kind == 'foreverPeriod',
+            'in_1826_scope': False,
         })
     return rows
 
@@ -1806,47 +1808,35 @@ def origin_ownership_inventory(certificates):
 
 
 def unique_non_rotating_cas(certificates):
-    """One row per 10-year non-rotating CA fingerprint, including injected copies."""
+    """Anchor verdicts to classified CA objects, then join copies by fingerprint."""
     by_fp = {}
     for c in certificates or []:
+        if not c.get('will_not_auto_rotate'):
+            continue
         for parsed in c.get('bundle_certs') or []:
-            reason = non_rotate_reason_for_cert(c.get('name'), {
-                'validity_days': parsed.get('validity_days'),
-                'subject': parsed.get('subject'),
-            })
-            if not reason:
-                continue
             fp = parsed.get('fingerprint')
-            if not fp:
+            if not fp or fp != c.get('fingerprint') or not parsed.get('is_ca'):
                 continue
-            rec = by_fp.get(fp)
-            loc = f"{c.get('namespace')}/{c.get('name')}"
-            owner = (c.get('owning_component') or '').strip()
-            desc = (c.get('owning_description') or '').strip()
-            if rec is None:
-                rec = dict(parsed)
-                rec['reason'] = reason
-                rec['copy_count'] = 0
-                rec['locations'] = []
-                rec['has_private_key'] = False
-                rec['_owners'] = []
-                rec['owning_description'] = ''
-                by_fp[fp] = rec
+            rec = by_fp.setdefault(fp, dict(parsed, reason=c.get('no_rotate_reason'),
+                copy_count=0, locations=[], has_private_key=False,
+                owning_component=c.get('owning_component') or '',
+                owning_description=c.get('owning_description') or ''))
+            rec['has_private_key'] |= bool(c.get('has_private_key'))
+    for c in certificates or []:
+        seen = set()
+        for parsed in c.get('bundle_certs') or []:
+            fp = parsed.get('fingerprint')
+            if fp not in by_fp or fp in seen:
+                continue
+            seen.add(fp)
+            rec = by_fp[fp]
             rec['copy_count'] += 1
-            if c.get('has_private_key'):
-                rec['has_private_key'] = True
-                if desc:
-                    rec['owning_description'] = desc
-            elif desc and not rec['owning_description']:
-                rec['owning_description'] = desc
-            if owner and owner not in rec['_owners']:
-                rec['_owners'].append(owner)
+            loc = f"{c.get('namespace')}/{c.get('name')}"
             if loc not in rec['locations'] and len(rec['locations']) < 12:
                 rec['locations'].append(loc)
-    rows = sorted(by_fp.values(), key=lambda r: ((r.get('cn') or ''), (r.get('subject') or '')))
+    rows = sorted(by_fp.values(), key=lambda r: (r.get('cn') or '', r.get('subject') or ''))
     for rec in rows:
-        rec['owning_component'] = ', '.join(rec.pop('_owners', []))
-        rec['private_key'] = bool(rec.get('has_private_key'))
+        rec['private_key'] = rec['has_private_key']
     return rows
 
 
@@ -1867,8 +1857,8 @@ WORK_TICKETS = {
 WORK_ACTIONS = {
     'missing-owner-new': 'Set openshift.io/owning-component to the Jira component that owns this lifecycle. OpenShift CI fails on new unowned artifacts.',
     'missing-owner-known': 'Grandfathered OpenShift TLS-registry violation (remove-only). Still needs an owner; do not add more of these.',
-    'ocpstrat-1826': 'kube-apiserver foreverPeriod artifact. 10-year validity and no supported auto or manual rotation yet (OCPSTRAT-1826). ShortCertRotation does not shorten it.',
-    'scr-10y': 'ShortCertRotation payload test skips ValidityDuration == "10y". This cert still auto-rotates on a long cycle (MCS ~8y, OVN/NNI ~9y).',
+    'ocpstrat-1826': 'kube-apiserver foreverPeriod artifact: ten-year validity, automatic renewal at eight years. ShortCertRotation does not shorten it.',
+    'scr-10y': 'ShortCertRotation payload test skips ValidityDuration == "10y". This cert still auto-rotates on a long cycle (MCS ~8y, OVN/NNI ~8y).',
     'scr-namespace': 'Owning operator never wired ShortCertRotation (ingress / OLM). The payload test ignores this namespace. Typical lifetime ~2y; still auto-rotated.',
     'installer-10y': 'Installer created-once 10-year signer. Same rotation gap as OCPSTRAT-1826.',
     'installer-10y-keyless': 'Installer leftover CA: public cert only; the private key was deleted with the bootstrap machine. This object will never be regenerated. kubelet-bootstrap-kubeconfig can be deleted to revoke installer master-bootstrap client certs after control-plane kubeconfigs no longer use them. admin-kubeconfig-client-ca must be kept for the original admin kubeconfig.',
@@ -1923,7 +1913,7 @@ TICKET_GROUP_URLS = {
     'No OCPSTRAT': '',
 }
 TICKET_GROUP_WHY = {
-    'OCPSTRAT-1826': '10-year certificates that will not auto-rotate (foreverPeriod, installer leftover CAs, HyperShift oneshot CAs).',
+    'OCPSTRAT-1826': '10-year certificates that will not auto-rotate (installer trust artifacts and HyperShift create-once CAs).',
     'OCPSTRAT-2272': 'Listed items are examples on this API of why this Feature is important: platform certificates whose lifetime is still over 5 years.',
     'OCPSTRAT-2273': 'Listed items are examples on this API of why this Feature is important: platform certificates whose lifetime is still over 2 years (and at most 5).',
     'OCPSTRAT-2271': 'Listed items are examples on this API of why this Feature is important: RSA self-signed signers still below 4096 bits (GA is OCPSTRAT-3050).',
@@ -2000,7 +1990,8 @@ def _has_key_not_bundle(cert):
 
 def _rotation_observable(cert):
     """Secrets OCPSTRAT-1990 can talk about: key present, not a bundle or injected copy."""
-    if cert.get('injected_ca_copy') or cert.get('will_not_auto_rotate'):
+    if (cert.get('injected_ca_copy') or cert.get('will_not_auto_rotate')
+            or cert.get('historical_revision') or cert.get('rotation_unverified')):
         return False
     if cert.get('cert_role') == 'ca-bundle' or not cert.get('has_private_key'):
         return False
@@ -2070,7 +2061,7 @@ def hpstrat99_tracker(certificates, counts):
                 'filter': 'ocpstrat-1826',
                 'count': sum(1 for c in certificates if c.get('will_not_auto_rotate')),
                 'observable': True,
-                'gap': '10-year certs that will not auto-rotate: kube-apiserver foreverPeriod, installer leftover CAs, HyperShift oneshot CAs. ShortCertRotation also skips foreverPeriod (10y). Auto-rotated 10y CAs (OVN, MCS, NNI) are OCPSTRAT-2272.',
+                'gap': '10-year certs that will not auto-rotate: installer trust artifacts and HyperShift create-once CAs. Kube-apiserver foreverPeriod certificates automatically rotate at eight years. ShortCertRotation also skips foreverPeriod (10y). Auto-rotated 10y CAs (OVN, MCS, NNI) are OCPSTRAT-2272.',
             },
             {
                 'key': 'OCPSTRAT-2272',
@@ -2311,6 +2302,9 @@ def compact_cert(cert):
         'owning_description': cert.get('owning_description'),
         'managed_status': cert.get('managed_status'),
         'mgmt_label': cert.get('mgmt_label'),
+        'rotation_unverified': bool(cert.get('rotation_unverified')),
+        'rotation_evidence': cert.get('rotation_evidence') or '',
+        'historical_revision': bool(cert.get('historical_revision')),
         'will_not_auto_rotate': cert.get('will_not_auto_rotate'),
         'no_rotate_reason': cert.get('no_rotate_reason'),
         'no_rotate_label': cert.get('no_rotate_label') or '',
@@ -2434,6 +2428,7 @@ def api_certificates():
             'missing_owners': uncovered,
             'uncovered': uncovered,
             'will_not_auto_rotate': no_rotate,
+            'rotation_unverified': [compact_cert(c) for c in certificates if c.get('rotation_unverified')],
             'forever_period': [compact_cert(c) for c in certificates if c.get('is_forever_period')],
             'not_shortened_by_scr': [compact_cert(c) for c in certificates if c.get('not_shortened_by_scr')],
             'compact': compact_rows,
@@ -2922,9 +2917,9 @@ HTML_TEMPLATE = '''
                     <dd>Certificate Authority — a certificate allowed to sign other certificates. OpenShift has many (API, service, ingress, etcd).
                         <span class="use">Used for: establishing a chain of trust. Anything this CA has signed is accepted by clients that trust it.</span></dd>
                     <dt>Signer</dt>
-                    <dd>The secret that holds a CA and its private key. Platform signers rotate at 80% of their own validity, except named 10-year CAs that are never regenerated
+                    <dd>The secret that holds a CA and its private key. Platform signers rotate at 80% of their own validity, except verified create-once CAs
                         (<a href="https://issues.redhat.com/browse/OCPSTRAT-1826" target="_blank" rel="noopener noreferrer">OCPSTRAT-1826</a>,
-                        installer kubeconfig signers, HyperShift oneshot). CNO <code>ovn-ca</code> / <code>signer-ca</code> are issued for 10 years but do rotate after 9.
+                        installer kubeconfig signers, HyperShift oneshot). CNO <code>ovn-ca</code> / <code>signer-ca</code> are issued for 10 years but trigger renewal at about 8 years.
                         <span class="use">Used for: issuing and renewing leaf certificates.</span></dd>
                     <dt>Leaf</dt>
                     <dd>An end-entity certificate (API serving, client, webhook) signed by a CA.
@@ -2933,10 +2928,8 @@ HTML_TEMPLATE = '''
                         <code>certificates.openshift.io/refresh-period</code>) — not on the CA’s schedule.
                         Service-CA serving certs use the same 2-year lifetime as the Service-CA;
                         kube-apiserver serving leaves under 10-year CAs are 30 days and still rotate.
-                        Two exceptions do not auto-rotate:
-                        <code>localhost-recovery-serving-certkey</code> (10-year leaf,
-                        <a href="https://issues.redhat.com/browse/OCPSTRAT-1826" target="_blank" rel="noopener noreferrer">OCPSTRAT-1826</a>),
-                        and any <strong>user-managed</strong> leaf (you rotate it).
+                        <code>localhost-recovery-serving-certkey</code> also rotates at about eight years.
+                        <strong>User-managed</strong> leaves require administrator renewal.
                         <span class="use">Used for: proving this server or client’s identity to whoever trusts the issuing CA.</span></dd>
                     <dt>CA bundle</dt>
                     <dd>One or more CA certificates stored together (a PEM list) in a configmap or secret. It does not hold the CA private key.
@@ -2956,36 +2949,22 @@ HTML_TEMPLATE = '''
                         <span class="use">Used for: storing certs and keys as data in Kubernetes secrets and configmaps.</span></dd>
                     <dt>Rotation</dt>
                     <dd>The owning operator replaces the certificate before <code>notAfter</code>. Platform-managed certs refresh at 80% of that cert’s lifetime, or at
-                        <code>certificates.openshift.io/refresh-period</code>. Named 10-year CAs and user-managed certs are not rotated this way.
+                        <code>certificates.openshift.io/refresh-period</code>. Create-once CAs and user-managed certs have no automatic schedule. Ten-year validity alone does not determine rotation.
                         <span class="use">Used for: keeping TLS valid so certificates do not expire in production.</span></dd>
                     <dt>Rotate-at</dt>
-                    <dd>The date this console predicts the operator will next refresh the cert (80% of validity, or the refresh annotation).
-                        <span class="use">Used for: spotting stuck rotation. If that date is past and the row is not in “Will not rotate”, the operator may not be reconciling.</span></dd>
+                    <dd>The date this console predicts the operator will next refresh the cert (the earlier of 80% of validity and the refresh annotation for library-go).
+                        Other controllers may use different schedules. Create-once CAs, historical revisions,
+                        and unverified long-lived CAs have no predicted date.
+                        <span class="use">Used for: identifying certificates whose owning controller needs investigation.</span></dd>
                     <dt>10-year CA</dt>
-                    <dd>Issued for about 10 years (3650 days) and never regenerated. That is the
-                        <a href="https://issues.redhat.com/browse/OCPSTRAT-1826" target="_blank" rel="noopener noreferrer">OCPSTRAT-1826</a>
-                        / installer / HyperShift oneshot gap. Short-lived certs that share those names (30d, 1y, 5y) still rotate and are not listed here.
-                        <span class="use">Used for: signing leaves for the life of the cluster. The gap is there is no supported way to replace that CA yet.</span></dd>
+                    <dd>Issued for about 3650 days. Lifetime alone does not determine renewal.
+                        HyperShift create-once CAs retain existing material; kube-apiserver, MCS,
+                        and CNO CAs automatically renew on a long cycle.</dd>
                     <dt>foreverPeriod</dt>
-                    <dd>The kube-apiserver operator’s name for a 10-year lifetime
-                        (<code>10 × 365 × 24h</code>, not calendar years). It is a Go duration in
-                        <code>certrotationcontroller.go</code>, not a Kubernetes annotation.
-                        The operator sets those serving signers (and the localhost-recovery leaf)
-                        to <code>Validity: foreverPeriod</code> and refresh at 8 years (80%).
-                        Rotating the CA then would not publish a replacement trust bundle, so
-                        the code treats that as “we effectively do not rotate.”
-                        That is the
-                        <a href="https://issues.redhat.com/browse/OCPSTRAT-1826" target="_blank" rel="noopener noreferrer">OCPSTRAT-1826</a>
-                        set: <code>localhost-serving-signer</code>,
-                        <code>service-network-serving-signer</code>,
-                        <code>loadbalancer-serving-signer</code>,
-                        <code>localhost-recovery-serving-signer</code>,
-                        and <code>localhost-recovery-serving-certkey</code>
-                        (plus static-pod revisions <code>localhost-recovery-serving-certkey-2</code> …).
-                        Installer and HyperShift 10-year CAs are the same gap by lifetime, but they
-                        are not this operator variable. CNO OperatorPKI, MCS, and network-node-identity
-                        10y certs are not <code>foreverPeriod</code>.
-                        <span class="use">Used for: naming the kube-apiserver artifacts that will not auto-rotate, and explaining why their Validity is 10y.</span></dd>
+                    <dd>The kube-apiserver operator's ten-year validity duration. The four serving
+                        signers and localhost-recovery serving certificate refresh at eight years (80%).
+                        The source comment “effectively do not rotate” describes the long interval;
+                        it does not disable rotation. Static-pod revision Secrets are historical copies.</dd>
                     <dt>ShortCertRotation</dt>
                     <dd>An install-time feature gate that shortens most library-go cert lifetimes to hours
                         (so payload tests can observe rotation). It does <em>not</em> rewrite
@@ -3019,29 +2998,25 @@ HTML_TEMPLATE = '''
                         <span class="use">Used for: telling a human (and this console) what the cert or CA bundle is for, not who owns the bug.</span></dd>
                     <dt>Validity</dt>
                     <dd>Lifetime of this certificate (<code>notAfter − notBefore</code>), not days remaining. A 10-year CA issued last month still shows Validity 10y and about 9 years left.
-                        <span class="use">Used for: telling a 30-day rotating cert from a 10-year CA that will not be regenerated.</span></dd>
+                        <span class="use">Used for: telling a 30-day rotating cert from a CA whose renewal policy must be checked separately.</span></dd>
                 </dl>
             </div>
         </details>
         {% if hosted_guest %}
-        <div class="warn-box">
-            This API is a <strong>hosted guest</strong> (<code>controlPlaneTopology: External</code>).
-            The five kube-apiserver <code>foreverPeriod</code> signer secrets in
-            <a href="https://issues.redhat.com/browse/OCPSTRAT-1826" target="_blank" rel="noopener noreferrer">OCPSTRAT-1826</a>
-            (<code>localhost-serving-signer</code>,
-            <code>service-network-serving-signer</code>,
-            <code>loadbalancer-serving-signer</code>,
-            <code>localhost-recovery-serving-signer</code>,
-            <code>localhost-recovery-serving-certkey</code>)
-            are <strong>not stored in this guest</strong>. On a standalone cluster they live in
-            <code>openshift-kube-apiserver-operator</code>; for this hosted cluster they live on
-            the <strong>management cluster</strong> (and HyperShift 10-year CAs with private keys
-            live in the hosted control-plane namespace). This console can only list secrets on
-            <em>this</em> API. 10-year CAs that do appear here are copies of those signers.
-            Scan the management cluster to see the signer secrets with keys.
-        </div>
+        <div class="warn-box">This API is a hosted guest. Control-plane CA signing keys normally
+            live in its namespace on the management cluster. Guest trust copies alone do not
+            establish whether their issuer rotates. Scan the management API for signer evidence.</div>
         {% endif %}
     </div>
+
+    {% if summary.rotation_unverified %}
+    <div class="warn-box"><strong>{{ summary.rotation_unverified }} CA renewal policies unverified.</strong>
+        These are excluded from confirmed non-rotating counts and have no predicted rotation date.
+        {% for cert in certificates if cert.rotation_unverified %}
+        <div><code>{{ cert.namespace }}/{{ cert.name }}</code>: {{ cert.rotation_evidence }}</div>
+        {% endfor %}
+    </div>
+    {% endif %}
 
     <div id="workboard-panel" class="filter-strips">
         <div class="filter-group-label">HPSTRAT-99 Features — click to see impacted certs</div>
@@ -3115,7 +3090,6 @@ HTML_TEMPLATE = '''
         <div id="1826-subfilters" class="filters" style="display: none;">
             <span class="muted">OCPSTRAT-1826 questions:</span>
             <button type="button" data-filter="ocpstrat-1826" onclick="applyFilter('ocpstrat-1826')">All {{ summary.ocpstrat_1826_filter }}</button>
-            <button type="button" data-filter="ocpstrat-1826-forever" onclick="applyFilter('ocpstrat-1826-forever')">foreverPeriod {{ summary.ocpstrat_1826_forever }}</button>
             <button type="button" data-filter="ocpstrat-1826-installer" onclick="applyFilter('ocpstrat-1826-installer')">installer leftover {{ summary.ocpstrat_1826_installer }}</button>
             <button type="button" data-filter="ocpstrat-1826-hypershift" onclick="applyFilter('ocpstrat-1826-hypershift')">HyperShift 10y {{ summary.ocpstrat_1826_hypershift }}</button>
             <button type="button" data-filter="ocpstrat-1826-namespace" onclick="applyFilter('ocpstrat-1826-namespace')">SCR namespace skip {{ summary.ocpstrat_1826_namespace }}</button>
@@ -3141,12 +3115,9 @@ HTML_TEMPLATE = '''
         </div>
         <div class="warn-box filter-note" data-filter-note="ocpstrat-1826" style="display: none;">
             <a href="https://issues.redhat.com/browse/OCPSTRAT-1826" target="_blank" rel="noopener noreferrer">OCPSTRAT-1826</a>:
-            10-year certs that will not auto-rotate — kube-apiserver
-            <code>foreverPeriod</code>, installer leftover CAs, HyperShift oneshot CAs.
-            Use the question buttons to split foreverPeriod, installer leftovers, and HyperShift 10y CAs.
-            <strong>SCR namespace skip</strong> is a related leftover: ingress / OLM never wired ShortCertRotation
-            (still auto-rotated, typically ~2y). Auto-rotated 10y CAs (OVN, MCS, NNI) are
-            <a href="https://issues.redhat.com/browse/OCPSTRAT-2272" target="_blank" rel="noopener noreferrer">OCPSTRAT-2272</a>.
+            Verified create-once HyperShift CAs and static installer trust artifacts.
+            Kube-apiserver foreverPeriod, MCS and CNO certificates automatically rotate at about
+            eight years and are excluded. Unverified renewal policies are listed separately.
         </div>
         <div class="warn-box filter-note" data-filter-note="ocpstrat-1826-forever" style="display: none;">
             <a href="https://issues.redhat.com/browse/OCPSTRAT-1826" target="_blank" rel="noopener noreferrer">OCPSTRAT-1826</a>
@@ -3221,11 +3192,11 @@ HTML_TEMPLATE = '''
         </div>
         <div class="info-box filter-note" data-filter-note="signer" style="display: none;">
             CAs that issue other certificates. Most rotate at 80% of validity.
-            OVN OperatorPKI (<code>ovn-ca</code>, <code>signer-ca</code>) is 10y and refreshes at 9y.
+            OVN OperatorPKI (<code>ovn-ca</code>, <code>signer-ca</code>) is 10y and triggers renewal at about 8y.
         </div>
         <div class="info-box filter-note" data-filter-note="leaf" style="display: none;">
             End-entity certs. Platform leaves rotate on their own schedule, not the CA’s.
-            Exception: recovery <code>certkey</code> (foreverPeriod) and user-managed leaves.
+            Recovery <code>certkey</code> automatically rotates at about eight years. User-managed leaves require administrator renewal.
         </div>
         <div class="warn-box filter-note" data-filter-note="external" style="display: none;">
             Issuer DN is not classified as OpenShift internal PKI.
@@ -3240,10 +3211,8 @@ HTML_TEMPLATE = '''
     </div>
 
     <div id="norotate-panel" style="display: none;">
-        <div class="section-title">Named foreverPeriod secrets (live check)</div>
-        <p class="muted">The five kube-apiserver <code>foreverPeriod</code> secrets.
-            Present on standalone/management; on a hosted guest they live on the
-            management cluster. Installer and HyperShift 10y CAs are in the table below.</p>
+        <div class="section-title">Automatically rotating foreverPeriod certificates (reference)</div>
+        <p class="muted">These kube-apiserver certificates refresh at eight years; they are not non-rotating work items. Historical revisions retain snapshots of the current certificate.</p>
         <table class="cert-table" id="ocpstrat-1826-table">
             <thead>
                 <tr>
@@ -3357,7 +3326,7 @@ HTML_TEMPLATE = '''
                     {% if cert.filter_expired %}
                     <div class="gap-pill"><span class="pill status-critical">expired</span></div>
                     {% elif cert.is_forever_period %}
-                    <div class="gap-pill"><span class="pill status-critical">foreverPeriod</span></div>
+                    <div class="gap-pill"><span class="pill status-info">auto-rotating · 8y cycle</span></div>
                     {% elif cert.not_shortened_by_scr %}
                     <div class="gap-pill"><span class="pill status-warning">SCR skip</span></div>
                     {% elif cert.will_not_auto_rotate %}
@@ -3370,6 +3339,9 @@ HTML_TEMPLATE = '''
                     <div class="muted">Keep: original admin kubeconfig CA</div>
                     {% elif cert.installer_ca_lifecycle == 'revocable-bootstrap' %}
                     <div class="muted">Revocable leftover master-bootstrap CA</div>
+                    {% endif %}
+                    {% if cert.rotation_unverified %}
+                    <div class="pill status-warning">Rotation unverified</div>
                     {% endif %}
                     {% if cert.owning_description %}
                     <div class="muted">{{ cert.owning_description }}</div>
@@ -3412,15 +3384,15 @@ HTML_TEMPLATE = '''
                         <span class="pill status-user">namespace skip</span>
                         <div class="muted">{{ cert.scr_skip_label }}</div>
                         {% elif cert.is_forever_period %}
-                        <span class="pill status-critical">foreverPeriod</span>
-                        <div class="muted">10y · no supported rotation</div>
+                        <span class="pill status-info">auto-rotating · 8y cycle</span>
+                        <div class="muted">10y validity · automatic renewal at about 8y</div>
                         <div class="muted">ShortCertRotation payload test skips 10y ValidityDuration</div>
                         {% elif cert.no_rotate_label %}
                         <span class="pill status-critical">{{ cert.no_rotate_label }}</span>
-                        <div class="muted">10y · no supported rotation</div>
+                        <div class="muted">10y · no automatic renewal</div>
                         {% else %}
                         <span class="pill status-critical">will not auto-rotate</span>
-                        <div class="muted">10y · no supported rotation</div>
+                        <div class="muted">10y · no automatic renewal</div>
                         {% endif %}
                         {% if cert.installer_ca_note %}
                         <div class="muted">{{ cert.installer_ca_note }}</div>
