@@ -65,7 +65,7 @@ class RotationTests(unittest.TestCase):
                 self.assertFalse(row['will_not_auto_rotate'])
                 self.assertFalse(row['rotation_unverified'])
                 self.assertIsNotNone(row['rotate_at'])
-                self.assertFalse(console.apply_inventory_filter_flags(row)['filter_1826'])
+                self.assertTrue(console.apply_inventory_filter_flags(row)['filter_1826'])
 
     def test_recovery_revision_has_no_predicted_date(self):
         obj, _ = resource('localhost-recovery-serving-certkey-235', namespace='openshift-kube-apiserver', ca=False, owned=False)
@@ -87,7 +87,7 @@ class RotationTests(unittest.TestCase):
                 self.assertTrue(row['will_not_auto_rotate'])
                 self.assertEqual(row['no_rotate_reason'], 'hypershift-10y')
                 self.assertIsNone(row['rotate_at'])
-                self.assertTrue(console.apply_inventory_filter_flags(row)['filter_1826'])
+                self.assertFalse(console.apply_inventory_filter_flags(row)['filter_1826'])
 
     def test_names_require_provenance_and_ten_year_ca(self):
         for kwargs in [dict(owned=False), dict(ca=False), dict(days=365), dict(include_key=False)]:
@@ -173,6 +173,45 @@ class RotationTests(unittest.TestCase):
         for name in ['ovn-ca', 'signer-ca']:
             row = console.compute_rotate_at(parsed, {}, False, name)
             self.assertEqual(datetime.fromisoformat(row['rotate_at_iso']), parsed['not_before'] + timedelta(days=8*365))
+
+    def test_procedure_scope_is_independent_of_nonrenewal(self):
+        rows = []
+        for name in console.KUBE_APISERVER_LONG_CYCLE:
+            ns = 'openshift-kube-apiserver' if name.endswith('certkey') else 'openshift-kube-apiserver-operator'
+            obj, _ = resource(name, namespace=ns, ca=not name.endswith('certkey'), owned=False)
+            rows.append(process(obj))
+        for ns, name, cn in [('openshift-config', 'admin-kubeconfig-client-ca', 'admin-kubeconfig-signer'),
+                             ('openshift-config-managed', 'kubelet-bootstrap-kubeconfig', 'kubelet-bootstrap-kubeconfig-signer')]:
+            pem, _ = cert(cn)
+            obj = client.V1ConfigMap(metadata=client.V1ObjectMeta(name=name, namespace=ns), data={'ca-bundle.crt': pem})
+            rows.append(console.process_resource_obj('configmap', obj, pem, False, ['ca-bundle.crt']))
+        for name, ns, owned in [('root-ca', 'hosted', True),
+                                ('localhost-recovery-serving-certkey-235', 'openshift-kube-apiserver', False),
+                                ('localhost-serving-signer', 'unrelated', False)]:
+            obj, _ = resource(name, namespace=ns, owned=owned)
+            rows.append(process(obj))
+        summary = console.summarize_certificates(rows)
+        self.assertEqual(summary['ocpstrat_1826_filter'], 7)
+        self.assertEqual(summary['ocpstrat_1826_forever'], 5)
+        self.assertEqual(summary['ocpstrat_1826_installer'], 2)
+        self.assertEqual(summary['will_not_auto_rotate'], 3)
+        self.assertFalse(rows[-2]['filter_1826'])
+        self.assertFalse(rows[-1]['filter_1826'])
+        work = console.workboard_report(rows)
+        group = next(g for g in work['by_ticket'] if g['ticket'] == 'OCPSTRAT-1826')
+        self.assertEqual(group['count'], 7)
+        self.assertEqual(sum(i['category'] == 'manual-rotation' for i in group['gaps']), 5)
+        self.assertEqual(next(g for g in work['by_ticket'] if g['ticket'] == 'Lifecycle review')['count'], 1)
+        with patch.object(console.cert_cache, 'get_data', return_value=(rows, 'test', datetime.now(timezone.utc))):
+            c = console.app.test_client()
+            data = c.get('/api/certificates').get_json()
+            self.assertEqual(len(data['procedure_planning']), 7)
+            self.assertEqual(len(data['will_not_auto_rotate']), 3)
+            page = c.get('/').data.decode()
+            self.assertIn('Manual rotation &amp; installer CA lifecycle', page)
+            self.assertIn('Kube-apiserver: auto + manual 5', page)
+            self.assertEqual(page.count('data-1826="1"'), 7)
+            self.assertEqual(page.count('data-non-rotating="1"'), 3)
 
     def test_ten_year_label_is_bounded(self):
         for days in [3649, 3650, 3652]:

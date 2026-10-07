@@ -74,7 +74,7 @@ There is **no image build**. `./deploy.sh` loads `Container/app.py` into a Confi
 
 Live artifacts on this API are grouped under the [HPSTRAT-99](https://issues.redhat.com/browse/HPSTRAT-99) Features they motivate, including:
 
-- [OCPSTRAT-1826](https://issues.redhat.com/browse/OCPSTRAT-1826) — verified create-once HyperShift CAs and static installer trust certificates
+- [OCPSTRAT-1826](https://issues.redhat.com/browse/OCPSTRAT-1826) — procedure planning for five automatically renewing kube-apiserver certificates and two installer CAs
 - [OCPSTRAT-2272](https://issues.redhat.com/browse/OCPSTRAT-2272) / [OCPSTRAT-2273](https://issues.redhat.com/browse/OCPSTRAT-2273) — platform validity still over 5 years, then over 2 years
 - [OCPSTRAT-2271](https://issues.redhat.com/browse/OCPSTRAT-2271) / [OCPSTRAT-3050](https://issues.redhat.com/browse/OCPSTRAT-3050) — RSA root CAs still below 4096 bits
 - [OCPSTRAT-2029](https://issues.redhat.com/browse/OCPSTRAT-2029) — external CA for platform certificates (capability; not a PEM list)
@@ -133,3 +133,25 @@ Run regression tests without a cluster (after installing `Container/requirements
 ```bash
 python -m unittest discover -s tests -v
 ```
+
+## Procedure planning versus automatic renewal
+
+The OCPSTRAT-1826 dashboard card is a **procedure planning** view: five current
+kube-apiserver certificates (four serving CAs and the recovery leaf), plus the
+two installer CA trust artifacts. The first five automatically renew at about
+eight years and also need a supported manual workflow. The installer CAs need
+validated credential replacement, migration or retirement decisions; that does
+not necessarily mean regenerating the original CA. This view is not a claim
+that a supported procedure has shipped or a confirmed release commitment.
+
+A separate **No automatic renewal** inventory retains the technical classification
+and includes HyperShift create-once CAs. HyperShift lifecycle work is grouped
+separately from the seven-certificate procedure; historical revisions are not
+additional procedure targets.
+
+API: `procedure_planning`, `manual_rotation_target`, `procedure_group`, and
+`procedure_action` expose procedural intent independently of `will_not_auto_rotate`.
+`summary.ocpstrat_1826_filter` and the feature count now count procedure-planning
+objects, not non-rotating certificates. The legacy `is_ocpstrat_1826` flag follows
+that same planning scope. Neither classification verifies successful end-to-end
+rotation: validate trust propagation and dependent consumers on supported releases.

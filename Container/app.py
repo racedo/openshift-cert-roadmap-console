@@ -356,16 +356,8 @@ INSTALLER_KEYLESS_CA_CN = frozenset({
     'kubelet-bootstrap-kubeconfig-signer',
 })
 INSTALLER_KEYLESS_NOTES = {
-    'revocable-bootstrap': (
-        'Installer leftover client CA; no private key. Deleting this ConfigMap '
-        'revokes installer master-bootstrap client certs. New workers already use '
-        'the node-bootstrapper token. Do not delete while control-plane nodes still '
-        'use the original cert-based /etc/kubernetes/kubeconfig.'
-    ),
-    'keep-recovery': (
-        'Installer leftover client CA; no private key. Keep this: it authenticates '
-        'the original admin kubeconfig. Removing it invalidates that kubeconfig.'
-    ),
+    'revocable-bootstrap': 'Original installer bootstrap trust. Validate which nodes and provisioning paths still depend on it; migrate credentials before considering retirement.',
+    'keep-recovery': 'Original installer admin trust. Establish and test replacement administrative and recovery access before considering retirement; removing trust invalidates the original admin kubeconfig.',
 }
 # OpenShift 10y = 10 * 365 * 24h (not calendar years). Days remaining is not lifetime.
 TEN_YEAR_DAYS = 3650
@@ -1505,7 +1497,6 @@ def process_resource_obj(resource_type, obj, cert_data, has_private_key, cert_fi
             'is_forever_period_signer': name in FOREVER_PERIOD_SIGNERS,
             'is_forever_period_leaf': is_forever_period_leaf_name(name),
             'is_forever_period': is_forever_period_name(name),
-            'is_ocpstrat_1826': will_not_rotate,
             'rotation_unverified': rotation_unverified,
             'rotation_evidence': rotation_evidence,
             'historical_revision': historical_revision,
@@ -1683,9 +1674,7 @@ def summarize_certificates(certificates):
         'not_shortened_by_scr': sum(1 for c in certificates if c.get('not_shortened_by_scr')),
         'ocpstrat_1826': sum(1 for c in certificates if c.get('is_ocpstrat_1826')),
         'ocpstrat_1826_filter': sum(1 for c in certificates if c.get('filter_1826')),
-        'ocpstrat_1826_forever': sum(
-            1 for c in certificates if c.get('no_rotate_reason') == 'ocpstrat-1826'
-        ),
+        'ocpstrat_1826_forever': sum(1 for c in certificates if c.get('manual_rotation_target')),
         'ocpstrat_1826_installer': sum(
             1 for c in certificates
             if c.get('no_rotate_reason') in ('installer-10y', 'installer-10y-keyless')
@@ -1772,7 +1761,7 @@ def short_cert_rotation_inventory(certificates):
             'owning_description': (primary or {}).get('owning_description') or '',
             'revision_count': len(hits),
             'revision_names': revision_names,
-            'in_1826_scope': False,
+            'in_1826_scope': any(c.get('filter_1826') for c in hits),
         })
     return rows
 
@@ -1845,7 +1834,7 @@ WORK_TICKETS = {
     'ocpstrat-1826': ('OCPSTRAT-1826', JIRA_BROWSE + 'OCPSTRAT-1826'),
     'installer-10y': ('OCPSTRAT-1826', JIRA_BROWSE + 'OCPSTRAT-1826'),
     'installer-10y-keyless': ('OCPSTRAT-1826', JIRA_BROWSE + 'OCPSTRAT-1826'),
-    'hypershift-10y': ('OCPSTRAT-1826', JIRA_BROWSE + 'OCPSTRAT-1826'),
+    'hypershift-10y': ('Lifecycle review', ''),
     'rsa-ca-below-4096': ('OCPSTRAT-2271', JIRA_BROWSE + 'OCPSTRAT-2271'),
     'past-rotate-at': ('OCPSTRAT-1990', JIRA_BROWSE + 'OCPSTRAT-1990'),
     'validity-over-5y': ('OCPSTRAT-2272', JIRA_BROWSE + 'OCPSTRAT-2272'),
@@ -1857,12 +1846,12 @@ WORK_TICKETS = {
 WORK_ACTIONS = {
     'missing-owner-new': 'Set openshift.io/owning-component to the Jira component that owns this lifecycle. OpenShift CI fails on new unowned artifacts.',
     'missing-owner-known': 'Grandfathered OpenShift TLS-registry violation (remove-only). Still needs an owner; do not add more of these.',
-    'ocpstrat-1826': 'kube-apiserver foreverPeriod artifact: ten-year validity, automatic renewal at eight years. ShortCertRotation does not shorten it.',
+    'ocpstrat-1826': 'Automatic renewal at about eight years. Also requires a supported manual rotation workflow that validates dependent certificates, trust distribution and consumer access. The trigger alone does not prove safe end-to-end rotation.',
     'scr-10y': 'ShortCertRotation payload test skips ValidityDuration == "10y". This cert still auto-rotates on a long cycle (MCS ~8y, OVN/NNI ~8y).',
     'scr-namespace': 'Owning operator never wired ShortCertRotation (ingress / OLM). The payload test ignores this namespace. Typical lifetime ~2y; still auto-rotated.',
     'installer-10y': 'Installer created-once 10-year signer. Same rotation gap as OCPSTRAT-1826.',
-    'installer-10y-keyless': 'Installer leftover CA: public cert only; the private key was deleted with the bootstrap machine. This object will never be regenerated. kubelet-bootstrap-kubeconfig can be deleted to revoke installer master-bootstrap client certs after control-plane kubeconfigs no longer use them. admin-kubeconfig-client-ca must be kept for the original admin kubeconfig.',
-    'hypershift-10y': 'HyperShift created-once 10-year CA (private key is on this API). Same rotation gap as OCPSTRAT-1826.',
+    'installer-10y-keyless': 'Installer CA trust has no automatic renewal. Validate dependent credentials and consumers before choosing replacement, migration or retirement; regenerating the same CA is not necessarily required.',
+    'hypershift-10y': 'HyperShift create-once CA with no automatic renewal. Track separately from the seven-certificate kube-apiserver and installer procedure; delivery scope requires its own decision.',
     'rsa-ca-below-4096': 'Self-signed RSA signer below 4096 bits. OCPSTRAT-2271 (TP) / OCPSTRAT-3050 (GA) require 4096 for RSA root CAs; re-issue this signer key.',
     'user-managed': 'OpenShift will not rotate this because an administrator supplied it. Rotate it before expiry, or move it onto Service-CA / an operator. This is not OCPSTRAT-1826 (those are platform 10-year signers).',
     'user-managed-hypershift': 'HostedCluster named serving cert: HyperShift copies this Secret and does not regenerate it. You rotate it. This is not OCPSTRAT-1826 (those are platform 10-year signers).',
@@ -1873,7 +1862,8 @@ WORK_ACTIONS = {
 }
 WORK_CATEGORY_LABELS = {
     'missing-owner': 'Missing owner',
-    'will-not-rotate': 'Will not auto-rotate',
+    'will-not-rotate': 'No automatic renewal',
+    'manual-rotation': 'Supported manual rotation procedure',
     'scr-test-skip': 'SCR test skip',
     'rsa-ca-below-4096': 'RSA CA below 4096',
     'user-managed': 'User-managed',
@@ -1891,8 +1881,10 @@ TICKET_GROUP_ORDER = (
     'OCPSTRAT-1990',
     'OpenShift CI',
     'No OCPSTRAT',
+    'Lifecycle review',
 )
 TICKET_GROUP_TITLES = {
+    'Lifecycle review': 'Other CA lifecycle work — scope to be decided',
     'OCPSTRAT-1826': 'Manual rotation of 10-year certificates',
     'OCPSTRAT-2272': 'Phase 1: platform certificate validity ≤ 5 years',
     'OCPSTRAT-2273': 'Phase 2: platform certificate validity ≤ 2 years',
@@ -1913,7 +1905,8 @@ TICKET_GROUP_URLS = {
     'No OCPSTRAT': '',
 }
 TICKET_GROUP_WHY = {
-    'OCPSTRAT-1826': '10-year certificates that will not auto-rotate (installer trust artifacts and HyperShift create-once CAs).',
+    'Lifecycle review': 'Confirmed non-renewing CAs outside the seven-certificate procedure planning view. This inventory is not a release commitment.',
+    'OCPSTRAT-1826': 'Procedure planning: automatic renewal plus supported manual rotation for kube-apiserver certificates; separate replacement, migration or retirement decisions for installer CAs. This view does not assert that a validated procedure has shipped.',
     'OCPSTRAT-2272': 'Listed items are examples on this API of why this Feature is important: platform certificates whose lifetime is still over 5 years.',
     'OCPSTRAT-2273': 'Listed items are examples on this API of why this Feature is important: platform certificates whose lifetime is still over 2 years (and at most 5).',
     'OCPSTRAT-2271': 'Listed items are examples on this API of why this Feature is important: RSA self-signed signers still below 4096 bits (GA is OCPSTRAT-3050).',
@@ -2002,7 +1995,28 @@ def apply_inventory_filter_flags(cert):
     """Flags for the Feature filter strip (must match visible inventory rows)."""
     if not cert:
         return cert
-    cert['filter_1826'] = bool(cert.get('will_not_auto_rotate'))
+    name, namespace = cert.get('name'), cert.get('namespace')
+    manual_rotation = bool(
+        cert.get('resource_type') == 'secret' and cert.get('has_private_key')
+        and is_ten_year_lifetime(cert.get('validity_days'))
+        and not cert.get('historical_revision')
+        and ((namespace == 'openshift-kube-apiserver-operator' and name in FOREVER_PERIOD_SIGNERS)
+             or (namespace == 'openshift-kube-apiserver' and name == 'localhost-recovery-serving-certkey'))
+    )
+    installer = cert.get('no_rotate_reason') == 'installer-10y-keyless'
+    cert['manual_rotation_target'] = manual_rotation
+    cert['procedure_group'] = ('kube-apiserver' if manual_rotation else 'installer-ca' if installer else '')
+    cert['procedure_action'] = (
+        'Automatic renewal is configured at about eight years. A supported manual rotation '
+        'procedure must also validate dependent certificates, trust propagation and consumer access.'
+        if manual_rotation else
+        'No automatic renewal. Validate credential replacement or migration and retirement of '
+        'old trust only after dependencies are removed; do not assume this CA must be regenerated.'
+        if installer else ''
+    )
+    cert['filter_non_rotating'] = bool(cert.get('will_not_auto_rotate'))
+    cert['filter_1826'] = bool(manual_rotation or installer)
+    cert['is_ocpstrat_1826'] = cert['filter_1826']
     cert['filter_2272'] = (
         _has_key_not_bundle(cert) and (cert.get('validity_days') or 0) > POLICY_5Y_DAYS
     )
@@ -2059,9 +2073,9 @@ def hpstrat99_tracker(certificates, counts):
                 'url': JIRA_BROWSE + 'OCPSTRAT-1826',
                 'title': 'Manual rotation of 10-year certificates',
                 'filter': 'ocpstrat-1826',
-                'count': sum(1 for c in certificates if c.get('will_not_auto_rotate')),
+                'count': sum(1 for c in certificates if c.get('filter_1826')),
                 'observable': True,
-                'gap': '10-year certs that will not auto-rotate: installer trust artifacts and HyperShift create-once CAs. Kube-apiserver foreverPeriod certificates automatically rotate at eight years. ShortCertRotation also skips foreverPeriod (10y). Auto-rotated 10y CAs (OVN, MCS, NNI) are OCPSTRAT-2272.',
+                'gap': 'Procedure planning: five operator-managed kube-apiserver rotation targets plus two installer CA lifecycle decisions. Automatic renewal and supported manual rotation are separate requirements. Historical revisions and HyperShift CAs are not counted in this seven-certificate planning view.',
             },
             {
                 'key': 'OCPSTRAT-2272',
@@ -2156,6 +2170,10 @@ def workboard_report(certificates):
             'missing-owner-known' if known else 'missing-owner-new',
             status='grandfathered' if known else 'new',
         ))
+
+    for c in certificates:
+        if c.get('manual_rotation_target'):
+            items.append(_work_item(c, 'manual-rotation', 'ocpstrat-1826', status='procedure-planning'))
 
     for c in certificates:
         if not c.get('will_not_auto_rotate'):
@@ -2306,6 +2324,9 @@ def compact_cert(cert):
         'rotation_evidence': cert.get('rotation_evidence') or '',
         'historical_revision': bool(cert.get('historical_revision')),
         'will_not_auto_rotate': cert.get('will_not_auto_rotate'),
+        'manual_rotation_target': bool(cert.get('manual_rotation_target')),
+        'procedure_group': cert.get('procedure_group') or '',
+        'procedure_action': cert.get('procedure_action') or '',
         'no_rotate_reason': cert.get('no_rotate_reason'),
         'no_rotate_label': cert.get('no_rotate_label') or '',
         'is_forever_period': bool(cert.get('is_forever_period')),
@@ -2428,6 +2449,7 @@ def api_certificates():
             'missing_owners': uncovered,
             'uncovered': uncovered,
             'will_not_auto_rotate': no_rotate,
+            'procedure_planning': [compact_cert(c) for c in certificates if c.get('filter_1826')],
             'rotation_unverified': [compact_cert(c) for c in certificates if c.get('rotation_unverified')],
             'forever_period': [compact_cert(c) for c in certificates if c.get('is_forever_period')],
             'not_shortened_by_scr': [compact_cert(c) for c in certificates if c.get('not_shortened_by_scr')],
@@ -2828,6 +2850,7 @@ HTML_TEMPLATE = '''
         .issuer-cell { max-width: 36em; word-break: break-word; }
         .issuer-cell code { font-size: 0.85em; display: block; }
         #inventory-table .col-evidence { display: none; }
+        #inventory-table.view-non-rotating .col-evidence,
         #inventory-table[class*="view-ocpstrat-1826"] .col-evidence,
         #inventory-table[class*="view-uncovered"] .col-evidence,
         #inventory-table.view-external .col-evidence,
@@ -2835,6 +2858,7 @@ HTML_TEMPLATE = '''
         #inventory-table[class*="view-ocpstrat-1990"] .col-evidence,
         #inventory-table.view-usermanaged .col-evidence { display: table-cell; }
         #inventory-table .ev { display: none; }
+        #inventory-table.view-non-rotating .ev-1826,
         #inventory-table[class*="view-ocpstrat-1826"] .ev-1826,
         #inventory-table[class*="view-uncovered"] .ev-uncovered,
         #inventory-table.view-external .ev-external,
@@ -2973,7 +2997,7 @@ HTML_TEMPLATE = '''
                         ingress and OLM namespaces whose operators never wired the gate.
                         That skip list is not
                         <a href="https://issues.redhat.com/browse/OCPSTRAT-1826" target="_blank" rel="noopener noreferrer">OCPSTRAT-1826</a>:
-                        1826 is 10-year certs that will not auto-rotate. OVN, MCS, and NNI CAs
+                        1826 covers supported manual rotation; it is not a synonym for lack of automatic renewal. OVN, MCS, and NNI CAs
                         still auto-rotate on a long cycle and belong on
                         <a href="https://issues.redhat.com/browse/OCPSTRAT-2272" target="_blank" rel="noopener noreferrer">OCPSTRAT-2272</a>;
                         ingress/OLM leftovers (~2y) belong on
@@ -3023,7 +3047,7 @@ HTML_TEMPLATE = '''
         <div class="summary feature-filters">
             <div class="summary-card" data-filter="ocpstrat-1826" onclick="applyFilter('ocpstrat-1826')">
                 <h3>OCPSTRAT-1826</h3>
-                <div class="summary-question">10y certs that will not auto-rotate</div>
+                <div class="summary-question">Manual rotation &amp; installer CA lifecycle</div>
                 <div class="summary-count" style="color: #721C24;">{{ summary.ocpstrat_1826_filter }}</div>
             </div>
             <div class="summary-card" data-filter="ocpstrat-2272" onclick="applyFilter('ocpstrat-2272')">
@@ -3063,8 +3087,21 @@ HTML_TEMPLATE = '''
             </div>
         </div>
 
-        <div class="filter-group-label">Inventory</div>
+        <div class="info-box">
+            <strong>Automatic renewal and manual procedures are separate questions.</strong>
+            Kube-apiserver: {{ summary.ocpstrat_1826_forever }} current certificates automatically renew
+            at about eight years and also need a supported manual rotation workflow.
+            Installer: {{ summary.ocpstrat_1826_installer }} CAs have no automatic renewal and need
+            credential replacement, migration or retirement decisions.
+            This is procedure planning, not a claim that a supported procedure is already available.
+        </div>
+        <div class="filter-group-label">Inventory — independent of procedure scope</div>
         <div class="summary">
+            <div class="summary-card" data-filter="non-rotating" onclick="applyFilter('non-rotating')">
+                <h3>No automatic renewal</h3>
+                <div class="summary-count">{{ summary.will_not_auto_rotate }}</div>
+                <div class="muted">Includes {{ summary.ocpstrat_1826_hypershift }} HyperShift CAs</div>
+            </div>
             <div class="summary-card active" data-filter="all" onclick="applyFilter('all')">
                 <h3>Total</h3>
                 <div class="summary-count">{{ summary.total }}</div>
@@ -3088,11 +3125,10 @@ HTML_TEMPLATE = '''
         </div>
 
         <div id="1826-subfilters" class="filters" style="display: none;">
-            <span class="muted">OCPSTRAT-1826 questions:</span>
+            <span class="muted">Procedure planning:</span>
             <button type="button" data-filter="ocpstrat-1826" onclick="applyFilter('ocpstrat-1826')">All {{ summary.ocpstrat_1826_filter }}</button>
-            <button type="button" data-filter="ocpstrat-1826-installer" onclick="applyFilter('ocpstrat-1826-installer')">installer leftover {{ summary.ocpstrat_1826_installer }}</button>
-            <button type="button" data-filter="ocpstrat-1826-hypershift" onclick="applyFilter('ocpstrat-1826-hypershift')">HyperShift 10y {{ summary.ocpstrat_1826_hypershift }}</button>
-            <button type="button" data-filter="ocpstrat-1826-namespace" onclick="applyFilter('ocpstrat-1826-namespace')">SCR namespace skip {{ summary.ocpstrat_1826_namespace }}</button>
+            <button type="button" data-filter="ocpstrat-1826-forever" onclick="applyFilter('ocpstrat-1826-forever')">Kube-apiserver: auto + manual {{ summary.ocpstrat_1826_forever }}</button>
+            <button type="button" data-filter="ocpstrat-1826-installer" onclick="applyFilter('ocpstrat-1826-installer')">Installer CA lifecycle {{ summary.ocpstrat_1826_installer }}</button>
         </div>
         <div id="2655-subfilters" class="filters" style="display: none;">
             <span class="muted">OCPSTRAT-2655 questions:</span>
@@ -3115,29 +3151,20 @@ HTML_TEMPLATE = '''
         </div>
         <div class="warn-box filter-note" data-filter-note="ocpstrat-1826" style="display: none;">
             <a href="https://issues.redhat.com/browse/OCPSTRAT-1826" target="_blank" rel="noopener noreferrer">OCPSTRAT-1826</a>:
-            Verified create-once HyperShift CAs and static installer trust artifacts.
-            Kube-apiserver foreverPeriod, MCS and CNO certificates automatically rotate at about
-            eight years and are excluded. Unverified renewal policies are listed separately.
+            Five kube-apiserver certificates renew automatically at about eight years and also need
+            a supported manual rotation workflow. The two installer CAs need separate credential and trust
+            lifecycle handling. These groups form the seven-certificate planning view; historical
+            revisions and HyperShift CAs are excluded from this count.
         </div>
         <div class="warn-box filter-note" data-filter-note="ocpstrat-1826-forever" style="display: none;">
             <a href="https://issues.redhat.com/browse/OCPSTRAT-1826" target="_blank" rel="noopener noreferrer">OCPSTRAT-1826</a>
-            question 1: kube-apiserver <code>foreverPeriod</code> secrets (four serving signers + recovery certkey).
+            Kube-apiserver: four serving CAs and one recovery leaf. Automatic renewal is configured at about eight years; manual rotation must also validate trust propagation and consumer access.
         </div>
         <div class="warn-box filter-note" data-filter-note="ocpstrat-1826-installer" style="display: none;">
             <a href="https://issues.redhat.com/browse/OCPSTRAT-1826" target="_blank" rel="noopener noreferrer">OCPSTRAT-1826</a>
-            question 2: installer leftover 10y CAs (<code>admin-kubeconfig-signer</code>,
-            <code>kubelet-bootstrap-kubeconfig-signer</code>), including keyless copies.
-        </div>
-        <div class="warn-box filter-note" data-filter-note="ocpstrat-1826-hypershift" style="display: none;">
-            <a href="https://issues.redhat.com/browse/OCPSTRAT-1826" target="_blank" rel="noopener noreferrer">OCPSTRAT-1826</a>
-            question 3: HyperShift oneshot 10y CAs (private key still on this API).
-        </div>
-        <div class="warn-box filter-note" data-filter-note="ocpstrat-1826-namespace" style="display: none;">
-            <a href="https://issues.redhat.com/browse/OCPSTRAT-1826" target="_blank" rel="noopener noreferrer">OCPSTRAT-1826</a>
-            related: ShortCertRotation is not honored because the owning operator never wired the
-            feature gate in this namespace (ingress <code>router-ca</code> /
-            <code>router-certs-default</code>, OLM <code>packageserver-service-cert</code>).
-            These still auto-rotate (typically ~2y). They are not the 10y will-not-rotate set.
+            Installer CA lifecycle: original 10y CAs (<code>admin-kubeconfig-signer</code>,
+            <code>kubelet-bootstrap-kubeconfig-signer</code>). Validate replacement, migration or
+            retirement of credentials and trust; this does not necessarily require regenerating the same CA.
         </div>
         <div class="warn-box filter-note" data-filter-note="ocpstrat-2272" style="display: none;">
             <a href="https://issues.redhat.com/browse/OCPSTRAT-2272" target="_blank" rel="noopener noreferrer">OCPSTRAT-2272</a>
@@ -3210,9 +3237,15 @@ HTML_TEMPLATE = '''
         </div>
     </div>
 
+    <div class="warn-box filter-note" data-filter-note="non-rotating" style="display: none;">
+        Verified lack of automatic renewal. Includes installer trust artifacts and HyperShift
+        create-once CAs. Kube-apiserver certificates are absent here because they have an automatic
+        renewal trigger; they remain in the manual procedure planning view.
+    </div>
+
     <div id="norotate-panel" style="display: none;">
-        <div class="section-title">Automatically rotating foreverPeriod certificates (reference)</div>
-        <p class="muted">These kube-apiserver certificates refresh at eight years; they are not non-rotating work items. Historical revisions retain snapshots of the current certificate.</p>
+        <div class="section-title">Kube-apiserver manual rotation targets — automatic renewal also configured</div>
+        <p class="muted">These certificates automatically refresh at about eight years. The manual workflow must validate dependent certificates and consumer trust. Only the current resources count as procedure targets; revisions are historical copies.</p>
         <table class="cert-table" id="ocpstrat-1826-table">
             <thead>
                 <tr>
@@ -3308,6 +3341,8 @@ HTML_TEMPLATE = '''
                 data-registry="{{ cert.tls_registry_status }}"
                 data-origin="{{ cert.issuer_origin }}"
                 data-1826="{{ '1' if cert.filter_1826 else '0' }}"
+                data-procedure-group="{{ cert.procedure_group or '' }}"
+                data-non-rotating="{{ '1' if cert.will_not_auto_rotate else '0' }}"
                 data-1826-reason="{{ cert.no_rotate_reason or '' }}"
                 data-scr-skip="{{ cert.scr_skip_kind or '' }}"
                 data-2272="{{ '1' if cert.filter_2272 else '0' }}"
@@ -3377,9 +3412,13 @@ HTML_TEMPLATE = '''
                 </td>
                 <td class="managed-status-cell status-{{ cert.mgmt_class }}">
                     {{ cert.mgmt_label }}
+                    {% if cert.procedure_group %}
+                    <div class="muted">{{ 'Manual rotation workflow also required' if cert.manual_rotation_target else 'Installer credential lifecycle decision required' }}</div>
+                    {% endif %}
                 </td>
                 <td class="col-evidence">
                     <div class="ev ev-1826">
+                        {% if cert.procedure_action %}<div>{{ cert.procedure_action }}</div>{% endif %}
                         {% if cert.scr_skip_kind == 'namespace' %}
                         <span class="pill status-user">namespace skip</span>
                         <div class="muted">{{ cert.scr_skip_label }}</div>
@@ -3529,7 +3568,8 @@ function applyFilter(name) {
     else if (name === 'leaf') show = row.getAttribute('data-role') === 'leaf';
     else if (name === 'external') show = row.getAttribute('data-origin') === 'external';
     else if (name === 'ocpstrat-1826') show = row.getAttribute('data-1826') === '1';
-    else if (name === 'ocpstrat-1826-forever') show = reason === 'ocpstrat-1826';
+    else if (name === 'ocpstrat-1826-forever') show = row.getAttribute('data-procedure-group') === 'kube-apiserver';
+    else if (name === 'non-rotating') show = row.getAttribute('data-non-rotating') === '1';
     else if (name === 'ocpstrat-1826-installer') show = reason === 'installer-10y' || reason === 'installer-10y-keyless';
     else if (name === 'ocpstrat-1826-hypershift') show = reason === 'hypershift-10y';
     else if (name === 'ocpstrat-1826-namespace') show = row.getAttribute('data-scr-skip') === 'namespace';
@@ -3580,14 +3620,15 @@ function applyFilter(name) {
   }
   var headings = {
     all: 'Certificates',
+    'non-rotating': 'No automatic renewal — independent of procedure scope',
     uncovered: 'OCPSTRAT-2655 — missing owners',
     'uncovered-new': 'OCPSTRAT-2655 — new missing owners',
     'uncovered-known': 'OCPSTRAT-2655 — grandfathered missing owners',
     signer: 'Signers',
     leaf: 'Leaves',
     external: 'External issuers (not OCPSTRAT-2029)',
-    'ocpstrat-1826': 'OCPSTRAT-1826 — 10y will not auto-rotate',
-    'ocpstrat-1826-forever': 'OCPSTRAT-1826 — foreverPeriod',
+    'ocpstrat-1826': 'Procedure planning — kube-apiserver rotation and installer CA lifecycle',
+    'ocpstrat-1826-forever': 'Kube-apiserver — automatic renewal plus manual rotation',
     'ocpstrat-1826-installer': 'OCPSTRAT-1826 — installer leftover CAs',
     'ocpstrat-1826-hypershift': 'OCPSTRAT-1826 — HyperShift 10y CAs',
     'ocpstrat-1826-namespace': 'OCPSTRAT-1826 — SCR not honored (namespace)',
@@ -3603,9 +3644,9 @@ function applyFilter(name) {
   var heading = document.getElementById('cert-heading-label');
   if (heading) heading.textContent = headings[name] || 'Certificates';
   var evidenceHead = {
-    'ocpstrat-1826': 'Why it will not rotate',
-    'ocpstrat-1826-forever': 'Why it will not rotate',
-    'ocpstrat-1826-installer': 'Why it will not rotate',
+    'ocpstrat-1826': 'Procedure requirement',
+    'ocpstrat-1826-forever': 'Manual workflow and automatic renewal',
+    'ocpstrat-1826-installer': 'Credential and trust lifecycle',
     'ocpstrat-1826-hypershift': 'Why it will not rotate',
     'ocpstrat-1826-namespace': 'Why SCR is not honored',
     uncovered: 'New vs grandfathered',
